@@ -423,27 +423,27 @@
             "departure_routes": {
                 "32": {
                     "TIDES": {
-                        "cleared_altitude": 12000,
+                        "cleared_altitude": 20000,
                         "sid": "TIDES1",
-                        "waypoints": "KSRQ-14 AQUAE/a2600/s220 PHINS/a4000+ TIDES/a5000+/s250/ho",
+                        "waypoints": "KSRQ-14 AQUAE/a2600/s220 PHINS/a4000+/R08 TIDES/a5000+/s250/ho",
                         "handoff_controller": "14"
                     },
                     "MOMIE": {
-                        "cleared_altitude": 12000,
+                        "cleared_altitude": 20000,
                         "sid": "TIDES1",
-                        "waypoints": "KSRQ-14 AQUAE/a2600/s220 PHINS/a4000+ TIDES/a5000+/s250/ho HYRON BRUNG ENDED",
+                        "waypoints": "KSRQ-14 AQUAE/a2600/s220 PHINS/a4000+ TIDES/a5000+/s250/hR08 HYRON/ho BRUNG ENDED",
                          "handoff_controller": "14"
                     },
                       "WILON": {
-                        "cleared_altitude": 12000,
+                        "cleared_altitude": 20000,
                         "sid": "TIDES1",
-                        "waypoints": "KSRQ-14 AQUAE/a2600/s220 PHINS/a4000+ TIDES/a5000+/s250/ho HYRON BRUNG ENDED",
+                        "waypoints": "KSRQ-14 AQUAE/a2600/s220 PHINS/a4000+ TIDES/a5000+/s250/hR08 HYRON/ho BRUNG ENDED",
                          "handoff_controller": "14"
                     },
                       "CAMJO": {
-                        "cleared_altitude": 12000,
+                        "cleared_altitude": 20000,
                         "sid": "TIDES1",
-                        "waypoints": "KSRQ-14 AQUAE/a2600/s220 PHINS/a4000+ TIDES/a5000+/s250/ho HYRON BRUNG ENDED WILON SPRNG",
+                        "waypoints": "KSRQ-14 AQUAE/a2600/s220 PHINS/a4000+ TIDES/a5000+/s250/hR08 HYRON/ho BRUNG ENDED WILON SPRNG",
                          "handoff_controller": "14"
                     }
                 }
@@ -843,33 +843,27 @@
                    {
                     "airlines": [
                         {
+                            "icao": "SWA"
+                        },
+                        {
                             "icao": "FFT"
                         },
                         {
-                            "icao": "AAL"
+
+                            "icao": "DAL",
+                            "types": ["A321", "B752"]
                         },
                         {
-                            "icao": "MXY"
-                        },
-                        {
-                            "icao": "NKS"
-                        },
-                        {
-                            "icao": "DAL"
-                        },
-                        {
-                            "icao": "UAL"
-                        },
-                        {
-                            "icao": "SWA"
+                            "icao": "FDX",
+                            "types": ["B763"]
                         }
                     ],
-                    "altitude": 31000,
-                    "destination": "KCLT",
+                    "destination": "KATL",
+                    "altitude": [31000,33000,35000],
                     "exit": "CAMJO",
-                    "route": "CAMJO TWINS PONZE"
-                },
-                {
+                    "route": "BAYPO2 CAMJO LAIRI LARZZ JJEDI4"
+                   },
+                   {
                     "airlines": [
                         {
                             "icao": "FFT"
@@ -879,65 +873,37 @@
                             "types": ["A320", "A321"]
                         },
                         {
+                            "icao": "UPS",
+                            "types": ["B752"]
+                        }
+                    ],
+                    "destination": "KPHL",
+                    "altitude": [31000,33000,35000,37000],
+                    "exit": "CAMJO",
+                    "route": "BAYPO2 CAMJO Q99 PEETT BBDOL PAATS4"
+                   },
+                   {
+                    "airlines": [
+                        {
+                            "icao": "SWA"
+                        },
+                        {
+                            "icao": "FFT"
+                        },
+                        {
                             "icao": "NKS"
                         },
                         {
                             "icao": "UAL",
-                              "types": ["B38M", "B39M"]
+                            "types": ["A320", "A21N", "B738", "B739"]
                         },
-                        {
-                            "icao": "DAL",
-                             "types": ["B752", "B753"]
-                        },
-                        {
-                            "icao": "SWA"
-                        }
-                    ],
-                    "altitude": 35000,
-                    "destination": "KPHL",
-                    "exit": "CAMJO",
-                    "route": "CAMJO Q99 PEETT BBDOL"
-                },
-                    {
-                    "airlines": [
                         {
                             "icao": "AAL",
-                              "types": ["B38M", "B39M"]
-                        },
-                        {
-                            "icao": "DAL",
-                            "types": ["B752", "B753"]
-                        },
-                        {
-                            "icao": "JBU"
+                            "types": ["A320", "A321", "B738", "B739"]
                         }
                     ],
-                    "altitude": 35000,
-                    "destination": "KJFK",
-                    "exit": "CAMJO",
-                    "route": "CAMJO Q109 DFENC SAWED Q97 DLAAY RADDS SIE CAMRN4"
-                },
-                  {
-                    "airlines": [
-                        {
-                            "icao": "ACA"
-                        },
-                        {
-                            "icao": "WJA"
-                        },
-                        {
-                            "icao": "UAL",
-                            "types": ["B38M", "B39M"]
-                        },
-                        {
-                            "icao": "POE"
-                        }
-                    ],
-                    "altitude": 37000,
-                    "destination": "CYYZ",
-                    "exit": "CAMJO",
-                    "route": "CAMJO Q99 BLAAN Q69 RICCS OXMAN"
-                }
+                    "destination": "KORD"
+                   }
             ],
              "exit_categories": {
                 "BAYPO": "BAYPO",
