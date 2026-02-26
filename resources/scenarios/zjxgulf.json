@@ -261,6 +261,148 @@
                     "destination": "MMGL",
                     "exit": "CIGAR",
                     "route": "OSPRY1 CIGAR IRDOV UM580 COFRE UT23 TAM UJ14 TMN UT147 AGU UT44 MEZCA UT44 LIVRI LIVRI1D"
+                },
+                {
+                    "airlines": [
+                        {
+                            "icao": "SWA"
+                        }
+                    ],
+                    "altitude": [32000,34000,36000,38000,40000],
+                    "destination": "KDAL",
+                    "exit": "REMIS",
+                    "route": "OSPRY1 REMIS Y280 REDFNAEX PNUTS REDDN4"
+                },
+                {
+                    "airlines": [
+                        {
+                            "icao": "UAL",
+                            "types": ["B38M", "B39M", "B738", "B739"]
+                        }
+                    ],
+                    "altitude": [32000,34000,36000,38000],
+                    "destination": "KIAH",
+                    "exit": "REMIS",
+                    "route": "OSPRY1 REMIS Y280 LEV JEPEG LINKK1"
+                },
+                {
+                    "airlines": [
+                        {
+                            "icao": "SWA"
+                        },
+                        {
+                            "icao": "NKS"
+                        },
+                        {
+                            "icao": "MXY"
+                        }
+                    ],
+                    "altitude": [32000,34000,36000,38000],
+                    "destination": "KMSY",
+                    "exit": "REMIS",
+                    "route": "OSPRY1 REMIS Y280 REDFN FATSO Q105 HRV"
+                },
+                {
+                    "airlines": [
+                        {
+                            "icao": "SWA"
+                        },
+                        {
+                            "icao": "NKS"
+                        }
+                    ],
+                    "altitude": [32000,34000,36000,38000],
+                    "destination": "KAUS",
+                    "exit": "REMIS",
+                    "route": "OSPRY1 REMIS Y280 LEV LCH WEEED WLEEE7"
+                },
+                {
+                    "airlines": [
+                        {
+                            "icao": "SWA"
+                        },
+                        {
+                            "icao": "FFT"
+                        }
+                    ],
+                    "altitude": [32000,34000,36000,38000],
+                    "destination": "KMDW",
+                    "exit": "JFRYS",
+                    "route": "RDSOX1 JFRYS BRUTS Q118 THRSR Q79 IIU DROSE FISSK7"
+                },
+                {
+                    "airlines": [
+                        {
+                            "icao": "SWA"
+                        },
+                        {
+                            "icao": "FFT"
+                        }
+                    ],
+                    "destination": "KSTL",
+                    "altitude": [32000,34000,36000,38000],
+                    "exit": "JFRYS",
+                    "route": "RDSOX1 JFRYS PATOY Q116 VLKNN GETME J151 VISQA BOOSH3"
+                },
+                {
+                    "airlines": [
+                        {
+                            "icao" :"AAL",
+                            "types": ["A321", "A21N"]
+                        },
+                        {
+                            "icao": "SWA"
+                        },
+                        {
+                            "icao": "FFt"
+                        }
+                    ],
+                    "destination": "KPHX",
+                    "altitude": [30000,32000,34000,36000],
+                    "exit": "REMIS",
+                    "route": "OSPRY1 REMIS Y280 REDFN SAT FST HUP ELP J50 ALIBY DRRVR PINNG1"
+                },
+                {
+                    "airlines": [
+                        {
+                            "icao": "SWA"
+                        }
+                    ],
+                    "destination":  "KHOU",
+                    "altitude": [32000,34000,36000,38000],
+                    "exit": "REMIS",
+                    "route": "OSPRY1 REMIS Y280 LEV BAYYY5"
+                },
+                {
+                    "airlines":[
+                        {
+                            "icao": "SWA"
+                        },
+                        {
+                            "icao": "FFT"
+                        }
+                    ],
+                    "destination": "KMCI",
+                    "altitude": [32000,34000,36000,38000],
+                    "exit": "JFRYS",
+                    "route": "RDSOX1 JFRYS PATOY Q116 JAWJA MGMRY JILLS RICKX HILTY KRTNY MHOMS3"
+                },
+                {
+                    "airlines": [
+                        {
+                            "icao": "SWA"
+                        },
+                        {
+                            "icao": "NKS"
+                        },
+                        {
+                            "icao": "FDX",
+                            "types": ["B763", "A306", "B752"]
+                        }
+                    ],
+                    "destination": "KMEM",
+                    "exit": "JFRYS",
+                    "route": "RDSOX1 JFRYS PATOY Q116 GOOGY WASER VANZE3"
                 }
             ],
             "exit_categories": {
