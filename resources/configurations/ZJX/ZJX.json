@@ -253,6 +253,14 @@
                     ]
                 }
             },
+            "ZJG": {
+                "inbound_assignments": {
+                    "GRNCH5": "15"
+                },
+                "default_consolidation": {
+                    "15": ["14"]
+                }
+            },
             "ZJX": {
                 "inbound_assignments": {
                     "BAGGY3": "50",
