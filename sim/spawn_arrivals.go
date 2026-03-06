@@ -126,7 +126,7 @@ func (s *Sim) createArrivalNoLock(group string, arrivalAirport string) (*Aircraf
 	nasFp.InboundHandoffController = s.InboundAssignments[group]
 	nasFp.Scratchpad = arr.Scratchpad
 	nasFp.SecondaryScratchpad = arr.SecondaryScratchpad
-	nasFp.RNAV = s.State.FacilityAdaptation.DisplayRNAVSymbol && arr.IsRNAV
+	nasFp.RNAV = s.State.FacilityAdaptation.Datablocks.DisplayRNAVSymbol && arr.IsRNAV
 
 	// For ERAM, set AssignedAltitude and derive PerceivedAssigned from waypoint restrictions.
 	if _, isERAM := av.DB.ARTCCs[s.State.Facility]; isERAM {
@@ -276,7 +276,7 @@ func (s *Sim) createOverflightNoLock(group string) (*Aircraft, error) {
 		return nil, err
 	}
 
-	_, isTRACON := av.DB.TRACONs[s.State.Facility]
+	isTRACON := av.DB.IsTRACON(s.State.Facility)
 	nasFp := s.initNASFlightPlan(ac, av.FlightTypeOverflight)
 	nasFp.Route = ac.FlightPlan.Route
 	nasFp.EntryFix = "" // TODO
@@ -288,7 +288,7 @@ func (s *Sim) createOverflightNoLock(group string) (*Aircraft, error) {
 	nasFp.Scratchpad = of.Scratchpad
 	nasFp.SecondaryScratchpad = of.SecondaryScratchpad
 	nasFp.AssignedAltitude = util.Select(!isTRACON, int(of.AssignedAltitude), 0)
-	nasFp.RNAV = s.State.FacilityAdaptation.DisplayRNAVSymbol && of.IsRNAV
+	nasFp.RNAV = s.State.FacilityAdaptation.Datablocks.DisplayRNAVSymbol && of.IsRNAV
 
 	if err := s.assignSquawk(ac, &nasFp); err != nil {
 		return nil, err

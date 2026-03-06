@@ -2280,7 +2280,7 @@
         "V267S": {
             "arrivals": [
                 {
-                    "waypoints": "CRG/ho V267 GUANO",
+                    "waypoints": "CRG V267 GUANO",
                     "cruise_altitude": 4000,
                     "initial_controller": "1S",
                     "route": "CRG V267 GUANO",
@@ -2741,9 +2741,7 @@
                     "KEVB": 2
                 }
             },
-            "configuration": {
-                "config_id": "DAE"
-            },
+            "configuration": "DAE",
             "default_maps": [
                 "DAB EAST FLOW"
             ],
@@ -2972,9 +2970,7 @@
                     "KEVB": 2
                 }
             },
-            "configuration": {
-                "config_id": "DAW"
-            },
+            "configuration": "DAW",
             "default_maps": [
                 "DAB WEST FLOW"
             ],
