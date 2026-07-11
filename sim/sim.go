@@ -983,7 +983,13 @@ func (s *Sim) updateState() {
 		}
 
 		if fp, ac, _ := s.getFlightPlanForACID(acid); fp != nil {
-			if fp.HandoffController != "" && s.isVirtualController(fp.HandoffController) {
+			if rh := fp.RedirectedHandoff; rh.RedirectedTo != "" && s.isVirtualController(rh.RedirectedTo) {
+				// Automated accept of a redirected handoff
+				s.lg.Debug("automatic redirected handoff accept", slog.String("acid", string(fp.ACID)),
+					slog.String("from", string(rh.OriginalOwner)),
+					slog.String("to", string(rh.RedirectedTo)))
+				s.acceptRedirectedHandoff(fp, ac, s.tcwForPosition(rh.RedirectedTo))
+			} else if fp.HandoffController != "" && s.isVirtualController(fp.HandoffController) {
 				// Automated accept
 				s.eventStream.Post(Event{
 					Type:           AcceptedHandoffEvent,
@@ -1083,6 +1089,12 @@ func (s *Sim) updateState() {
 					// the altitude is assigned, just deferred until the speed change completes.
 					s.enqueuePilotTransmission(callsign, TCP(ac.ControllerFrequency), PendingTransmissionRequestAltitude)
 				}
+			}
+
+			if passedWaypoint != nil && passedWaypoint.FAF() && ac.IsAssociated() &&
+				ac.Nav.Approach.Cleared && !ac.GotContactTower {
+				// Passed the FAF without being sent to tower: ask about switching.
+				s.enqueuePilotTransmission(callsign, TCP(ac.ControllerFrequency), PendingTransmissionRequestTowerSwitch)
 			}
 
 			if ac.FirstSeen.IsZero() && s.isRadarVisible(ac) {
@@ -1251,7 +1263,7 @@ func (s *Sim) updateState() {
 			}
 
 			// Cull far-away aircraft
-			defaultMaxDist := util.Select(av.DB.IsARTCC(s.State.Facility), float32(400), float32(125))
+			defaultMaxDist := util.Select(av.DB.IsARTCC(s.State.Facility), float32(400), float32(200))
 			maxDist := util.Select(s.State.FacilityAdaptation.MaxDistance > 0, s.State.FacilityAdaptation.MaxDistance, defaultMaxDist)
 			if math.NMDistance2LL(ac.Position(), s.State.Center) > maxDist {
 				s.lg.Debug("culled far-away aircraft", slog.String("adsb_callsign", string(callsign)))
@@ -1278,6 +1290,7 @@ func (s *Sim) updateState() {
 		s.checkFinalApproachSpacing()
 
 		s.updatePatternPhases()
+		s.relievePatternPressure()
 		s.spawnAircraft()
 
 		s.ERAMComputer.Update(s)
