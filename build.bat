@@ -135,12 +135,17 @@ if not exist "ext\SDL2-2.24.0" (
 )
 
 REM Set SDL2 paths only if not already set (allows CI to override)
+REM Captured into ROOTDIR outside the if-block and referenced via delayed
+REM expansion (!VAR!) below, since paths containing "(" or ")" (e.g. a
+REM parent directory named "Foo (3)") break cmd's block parser if expanded
+REM with %VAR% syntax from inside a parenthesized block.
+set "ROOTDIR=%CD%"
 if not defined CGO_CFLAGS (
-    set SDL2_DIR=%CD%\ext\SDL2-2.24.0\x86_64-w64-mingw32
+    set "SDL2_DIR=!ROOTDIR!\ext\SDL2-2.24.0\x86_64-w64-mingw32"
     set CGO_CFLAGS=-I !SDL2_DIR!\include
     set CGO_CPPFLAGS=-I !SDL2_DIR!\include
     set CGO_LDFLAGS=-L !SDL2_DIR!\lib
-)   
+)
 
 REM Copy runtime DLLs from ext/ to windows/ if available
 set MINGW_BIN=%CD%\ext\mingw\mingw64\bin

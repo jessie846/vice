@@ -12234,6 +12234,250 @@
       }
     },
     {
+      "icao": "are",
+      "name": "LATAM Airlines Colombia",
+      "callsign": {
+       "name": "LAN Colombia",
+        "callsignFormats": ["###"]
+      },
+      "fleets": {
+        "default": [
+          ["A320", 10]
+        ]
+      }
+    },
+     {
+      "icao": "cap",
+      "name": "Civil Air Patrol",
+      "callsign": {
+        "name": "CAP",
+        "callsignFormats": ["###"]
+      },
+      "fleets": {
+        "default": [
+          ["C152", 10]
+        ]
+      }
+    },
+     {
+      "icao": "cyt",
+      "name": "Crystal Air",
+      "callsign": {
+        "name": "Crystal Air",
+        "callsignFormats": ["##"]
+      },
+      "fleets": {
+        "default": [
+          ["C25C", 1],
+          ["SF50", 1]
+        ]
+      }
+    },
+     {
+      "icao": "frg",
+      "name": "Freight Runners Express",
+      "callsign": {
+        "name": "Freight Runners",
+        "callsignFormats": ["####"]
+      },
+      "fleets": {
+        "default": [
+          ["E120", 4],
+          ["BE99", 10]
+        ]
+      }
+    },
+     {
+      "icao": "fwk",
+      "name": "Flightworks",
+      "callsign": {
+        "name": "Flightworks",
+        "callsignFormats": ["###"]
+      },
+      "fleets": {
+        "default": [
+          ["CL60", 4]
+        ]
+      }
+    },
+     {
+      "icao": "her",
+      "name": "Hera Flight",
+      "callsign": {
+        "name": "Hera",
+        "callsignFormats": ["###"]
+      },
+      "fleets": {
+        "default": [
+         ["C750", 5],
+          ["CL30", 1],
+          ["CL60", 2],
+          ["FA20", 1],
+          ["GLF4", 4],
+          ["LJ60", 2]
+        ]
+      }
+    },
+    {
+      "icao": "hrt",
+      "name": "Chartright Air",
+      "callsign": {
+        "name": "Chartright",
+        "callsignFormats": ["###"]
+      },
+      "fleets": {
+        "default": [
+            ["C560", 4],
+            ["C56X", 2],
+            ["CL30", 1],
+            ["CL35", 3],
+            ["F2TH", 2],
+            ["GALX", 2],
+            ["H25B", 1],
+            ["LJ45", 1]
+        ]
+      }
+    },
+    {
+      "icao": "jnx",
+      "name": "Fly Dreams",
+      "callsign": {
+        "name": "Nexa",
+        "callsignFormats": ["##"]
+      },
+      "fleets": {
+        "default": [
+            ["C560", 4],
+            ["C56X", 2],
+            ["CL30", 1],
+            ["CL35", 3],
+            ["F2TH", 2],
+            ["GALX", 2],
+            ["H25B", 1],
+            ["LJ45", 1]
+        ]
+      }
+    },
+    {
+      "icao": "lbq",
+      "name": "Quest Diagnostics",
+      "callsign": {
+        "name": "Labquest",
+        "callsignFormats": ["##", "###"]
+      },
+      "fleets": {
+        "default": [
+            ["PC12", 12]
+        ]
+      }
+    },
+    {
+      "icao": "pfa",
+      "name": "Paris Air",
+      "callsign": {
+        "name": "Paris Air",
+        "callsignFormats": ["###"]
+      },
+      "fleets": {
+        "default": [
+          ["P28A", 50]
+        ]
+      }
+    },
+     {
+      "icao": "pjc",
+      "name": "Pittsburg Jet Center",
+      "callsign": {
+        "name": "Private Jet Center",
+        "callsignFormats": ["##", "###"]
+      },
+      "fleets": {
+        "default": [
+            ["C25B",3],
+            ["C25C", 1],
+            ["C56X",7]
+        ]
+      }
+    },
+    {
+      "icao": "rkj",
+      "name": "Charter Airlines",
+      "callsign": {
+        "name": "Arca jet",
+        "callsignFormats": ["###"]
+      },
+       "fleets": {
+        "default": [
+            ["C750",11]
+        ]
+      }
+    },
+     {
+      "icao": "sfy",
+      "name": "Skyborne Airline Academy",
+      "callsign": {
+        "name": "Sky Flite",
+        "callsignFormats": ["###"]
+      },
+       "fleets": {
+        "default": [
+               ["P28A", 50]
+        ]
+      }
+    },
+     {
+      "icao": "tcf",
+      "name": "Florida Institute of Technology",
+      "callsign": {
+        "name": "Tech Flight",
+        "callsignFormats": ["###"]
+      },
+       "fleets": {
+        "default": [
+               ["P28A", 50]
+        ]
+      }
+    },
+    {
+      "icao": "ftt",
+      "name": "Flight Fast Track",
+      "callsign": {
+        "name": "Fast Air",
+        "callsignFormats": ["#"]
+      },
+       "fleets": {
+        "default": [
+               ["P28A", 10]
+        ]
+      }
+    },
+    {
+      "icao": "ubt",
+      "name": "Norse Atlantic UK Limited",
+      "callsign": {
+        "name": "Longboat",
+        "callsignFormats": ["##@", "#@@"]
+      },
+       "fleets": {
+        "default": [
+               ["B789", 7]
+        ]
+      }
+    },
+         {
+      "icao": "sjj",
+      "name": "Spirit Jets",
+      "callsign": {
+        "name": "Spirit Jet",
+        "callsignFormats": ["###"]
+      },
+       "fleets": {
+        "default": [
+               ["CL60",2]
+        ]
+      }
+    },
+    {
       "icao": "njm",
       "name": "Northern Jet",
       "callsign": {
