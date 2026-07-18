@@ -692,6 +692,19 @@
           "1W": ["1M"] 
         }
       },
+      "SDS": {
+        "default_consolidation": {
+          "1D": []
+        },
+        "departure_assignments": {
+          "KISM": "1D"
+        },
+        "inbound_assignments": {
+          "ORL/ISM/SFB.SATSE": "1D",
+          "T210S": "1D",
+          "T210N": "1D"
+        }
+      },
       "FCS": {
         "inbound_assignments": {
           "GRNCH5.FNLS": "1L"
