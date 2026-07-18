@@ -27646,7 +27646,7 @@
           "expect_approach": "I7",
           "scratchpad": "TI",
           "initial_speed": 250,
-          "waypoints": "THANO/a7000-9000 RAGNR/a7000- LOKII/a5000 MUNKZ/a5000/s210 N028.52.28.867,W081.19.45.095/d30 N028.52.28.867,W081.19.45.095 N028.52.28.867,W081.19.45.095 N028.52.28.867,W081.19.45.095/h200/ho1D",
+          "waypoints": "THANO/a7000-9000 RAGNR/a7000- LOKII/a5000 MUNKZ/a5000/s210 N028.50.50.415,W081.32.34.302/a3000/h220/ho1D",
           "airlines": {
             "KORL": [
               {
