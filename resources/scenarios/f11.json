@@ -26316,7 +26316,7 @@
           "initial_altitude": 19000,
           "initial_controller": "1L",
           "initial_speed": 280,
-          "waypoints":"BULKS/a19000/s280 PRICY/a13000-16000/s250 BOCCE/h010/d60/ho1D",
+          "waypoints":"BULKS/a19000/s280 PRICY/a13000-16000/s250/d60 BOCCE/h010/ho1D",
           "airlines": {
             "KORL": [
               {
