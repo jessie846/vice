@@ -1387,13 +1387,13 @@
             "cleared_altitude": 7000,
             "sid": "RDSOX1",
             "is_rnav": true,
-            "waypoints": "KMCO-18L FACTS/a2300+ EARRS/a3000+ LEFTI/a4000+/s230- BLOSM/a7000- OSPRY"
+            "waypoints": "KMCO-18L FACTS/a2300+ EARRS/a3000+ LEFTI/a4000+/s230- BLOSM/a7000- RDSOX"
           },
           "JFRYS": {
             "cleared_altitude": 7000,
             "sid": "RDSOX1",
             "is_rnav": true,
-            "waypoints": "KMCO-18L FACTS/a2300+ EARRS/a3000+ LEFTI/a4000+/s230- BLOSM/a7000- OSPRY GDUNN KNOST"
+            "waypoints": "KMCO-18L FACTS/a2300+ EARRS/a3000+ LEFTI/a4000+/s230- BLOSM/a7000- RDSOX JFRYS"
           }
         },
         "35L": {
@@ -1525,13 +1525,13 @@
             "cleared_altitude": 7000,
             "sid": "RDSOX1",
             "is_rnav": true,
-            "waypoints": "KMCO-17L SAWZZ/a2300+ HANDD/a3000+/s230- LEFTI/a4000+/s230- BLOSM/a7000- OSPRY"
+            "waypoints": "KMCO-17L SAWZZ/a2300+ HANDD/a3000+/s230- LEFTI/a4000+/s230- BLOSM/a7000- RDSOX"
           },
           "JFRYS": {
             "cleared_altitude": 7000,
             "sid": "RDSOX1",
             "is_rnav": true,
-            "waypoints": "KMCO-17L SAWZZ/a2300+ HANDD/a3000+/s230- LEFTI/a4000+/s230- BLOSM/a7000- OSPRY GDUNN KNOST"
+            "waypoints": "KMCO-17L SAWZZ/a2300+ HANDD/a3000+/s230- LEFTI/a4000+/s230- BLOSM/a7000- RDSOX JFRYS"
           }
         },
         "35R": {
@@ -1663,13 +1663,13 @@
             "cleared_altitude": 7000,
             "sid": "RDSOX1",
             "is_rnav": true,
-            "waypoints": "KMCO-17R SAWZZ/a2300+ HANDD/a3000+/s230- LEFTI/a4000+/s230- BLOSM/a7000- OSPRY"
+            "waypoints": "KMCO-17R SAWZZ/a2300+ HANDD/a3000+/s230- LEFTI/a4000+/s230- BLOSM/a7000- RDSOX"
           },
           "JFRYS": {
             "cleared_altitude": 7000,
             "sid": "RDSOX1",
             "is_rnav": true,
-            "waypoints": "KMCO-17R SAWZZ/a2300+ HANDD/a3000+/s230- LEFTI/a4000+/s230- BLOSM/a7000- OSPRY GDUNN KNOST"
+            "waypoints": "KMCO-17R SAWZZ/a2300+ HANDD/a3000+/s230- LEFTI/a4000+/s230- BLOSM/a7000- RDSOX JFRYS"
           }
         }
       },
@@ -23873,6 +23873,27 @@
         }
       ]
     },
+    "ISM6.FNLN": {
+      "arrivals": [
+        {
+          "initial_altitude": 3000,
+          "initial_controller": "1D",
+          "initial_speed": 110,
+          "scratchpad": "KG",
+          "route": "./ KISM",
+          "waypoints": "N028.32.50.514,W081.52.57.767 JENSN/a2000 FOJSO/a2000 TOTNY/a1700 EHECU/a760 KISM-6/a45",
+          "airlines": {
+            "KISM": [
+              {
+                "airport": "KOCF",
+                "icao": "N",
+                "fleet": "GAsinglepiston"
+              }
+            ]
+          }
+        }
+      ]
+    },
      "PRICY5.MCOS": {
       "arrivals": [
         {
@@ -26401,7 +26422,7 @@
           "is_rnav": true,
           "initial_speed": 210,
           "route": "KORL WORMS GUANO KIZER",
-         "waypoints": "KORL-25/c15/ho1V NYTES N028.39.51.634,W081.14.14.379/c20 N028.37.30.260,W081.13.56.938/c30/ho1E DEARY/c140 TRV/delete",
+        "waypoints": "KORL-25/c15/ho1V NYTES N028.39.51.634,W081.14.14.379/c20 N028.39.36.020,W081.08.15.785/c30 N028.41.15.048,W080.58.14.641/ho1A/c50 N028.32.36.623,W080.53.42.866/ho1E/c70 DEARY TRV/delete",
           "airlines": {
             "KORL": [
               {
@@ -26434,7 +26455,7 @@
           "is_rnav": true,
           "initial_speed": 110,
           "route": "KORL DEARY",
-          "waypoints": "KORL-25/c15/ho1V NYTES N028.39.51.634,W081.14.14.379/c20 N028.37.30.260,W081.13.56.938/c30/ho1E DEARY/c70 TRV/delete",
+          "waypoints": "KORL-25/c15/ho1V NYTES N028.39.51.634,W081.14.14.379/c20 N028.39.36.020,W081.08.15.785 N028.41.15.048,W080.58.14.641/ho1A/c50 N028.32.36.623,W080.53.42.866/ho1E/c70 DEARY TRV/delete",
           "airlines": {
             "KORL": [
               {
@@ -26453,6 +26474,380 @@
               {
                 "airport": "KVRB",
                 "icao": "SFY"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "MCODEP.FNLN": {
+      "arrivals": [
+        {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO FATHE4 VIYAP",
+          "scratchpad": "W31",
+          "waypoints": "KMCO-17R JWOLF/c70   JIRAN BIGSE GOTHA/a7000- FATHE MDBOG/delete",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
+              }
+            ]
+          }
+        },
+         {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO FATHE4 VIYAP",
+          "scratchpad": "W33",
+          "waypoints": "KMCO-17R JWOLF/c70   JIRAN BIGSE GOTHA/a7000- FATHE MDBOG/delete",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
+              }
+            ]
+          }
+        },
+         {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO FATHE4 VIYAP",
+          "scratchpad": "W35",
+          "waypoints": "KMCO-17R JWOLF/c70   JIRAN BIGSE GOTHA/a7000- FATHE MDBOG/delete",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
+              }
+            ]
+          }
+        },
+         {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO FATHE4 VIYAP",
+          "scratchpad": "W37",
+           "waypoints": "KMCO-17R JWOLF/c70   JIRAN BIGSE GOTHA/a7000- FATHE MDBOG/delete",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
+              }
+            ]
+          }
+        },
+         {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO FATHE4 VIYAP",
+          "scratchpad": "W39",
+            "waypoints": "KMCO-17R JWOLF/c70   JIRAN BIGSE GOTHA/a7000- FATHE MDBOG/delete",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
+              }
+            ]
+          }
+        },
+         {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO RDSOX1 JFRYS",
+          "scratchpad": "R30",
+          "waypoints": "KMCO-18L FACTS/c70 EARRS  LEFTI BLOSM/a7000- RDSOX/c160/delete ",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
+              }
+            ]
+          }
+        },
+         {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO RDSOX1 JFRYS",
+          "scratchpad": "R32",
+          "waypoints": "KMCO-18L FACTS/c70 EARRS  LEFTI BLOSM/a7000- RDSOX/c160/delete ",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
+              }
+            ]
+          }
+        },
+         {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO RDSOX1 JFRYS",
+          "scratchpad": "R34",
+          "waypoints": "KMCO-18L FACTS/c70 EARRS  LEFTI BLOSM/a7000- RDSOX/c160/delete ",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
+              }
+            ]
+          }
+        },
+         {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO RDSOX1 JFRYS",
+          "scratchpad": "R38",
+          "waypoints": "KMCO-18L FACTS/c70 EARRS  LEFTI BLOSM/a7000- RDSOX/c160/delete ",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
+              }
+            ]
+          }
+        },
+         {
+          "initial_altitude": 1500,
+          "initial_controller": "1E",
+          "is_rnav": true,
+          "initial_speed": 210,
+          "route": "KMCO RDSOX1 JFRYS",
+          "scratchpad": "R36",
+          "waypoints": "KMCO-18L FACTS/c70 EARRS  LEFTI BLOSM/a7000- RDSOX/c160/delete ",
+          "airlines": {
+            "KMCO": [
+              {
+                "icao": "SWA",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "FFT",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "JBU",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "AAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "UAL",
+                "airport": "KBUF"
+              },
+                {
+                "icao": "DAL",
+                "airport": "KBUF"
               }
             ]
           }
@@ -31211,7 +31606,7 @@
         },
         {
           "airport": "KISM",
-          "runway": "33"
+          "runway": "6"
         }
       ],
       "inbound_rates": {
@@ -31228,10 +31623,13 @@
           "KMCO": 10
         },
         "ORL/SFB.FNLS": {
-          "KORL": 25
+          "KORL": 17
         },
-        "ISM33.FNLN": {
+        "ISM6.FNLN": {
           "KISM": 5
+        },
+        "MCODEP.FNLN": {
+          "KMCO": 25
         }
       },
        "vfr_rate_scale": 1.2,
@@ -31585,11 +31983,6 @@
           "airport": "KSFB",
           "rate": 17,
           "runway": "9L"
-        },
-         {
-          "airport": "KISM",
-          "rate": 4,
-          "runway": "33"
         },
         {
           "airport": "KMLB",
