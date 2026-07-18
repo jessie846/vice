@@ -699,6 +699,14 @@
         "default_consolidation": {
           "1M": ["1G"]
         }
+      },
+        "FCN": {
+        "inbound_assignments": {
+          "GRNCH5.FNLS": "1L"
+        },
+        "default_consolidation": {
+          "1M": ["1G"]
+        }
       }
     },
     
