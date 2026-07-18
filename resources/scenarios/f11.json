@@ -34802,10 +34802,14 @@
           "KMCO": 12
         },
         "ORL/SFB.FNLS": {
-          "KORL": 25
+          "KORL": 20
         },
         "MCODEP.FNLS": {
-          "KMCO": 25
+          "KMCO": 20
+        },
+        "ORL/SFB.SATDSE": {
+          "KORL": 5,
+          "KSFB": 5
         }
       },
       "vfr_rate_scale": 1.2,
