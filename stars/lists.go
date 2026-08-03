@@ -531,6 +531,9 @@ func (sp *STARSPane) drawSSAList(ctx *panes.Context, pw [2]float32, listStyle re
 		if ps.CRDA.Disabled {
 			disabled = append(disabled, "CRDA")
 		}
+		if ctx.Client.State.AutoHandoffSiteInhibited {
+			disabled = append(disabled, "HOP")
+		}
 		if !ctx.Client.State.ATPAEnabled {
 			disabled = append(disabled, "INTRAIL")
 		}
@@ -761,6 +764,22 @@ func (sp *STARSPane) drawSSAList(ctx *panes.Context, pw [2]float32, listStyle re
 		}
 	}
 
+	// TCP OFF indicators for the entering TCP (2-85, Table 2-20).
+	if filter.All || filter.TCPOff {
+		tcp := ctx.UserPrimaryPosition()
+		if inh := ctx.Client.State.AutoHandoffTCPInhibits[tcp]; inh != (sim.AutoHandoffInhibit{}) {
+			var off []string
+			if inh.Intrafacility {
+				off = append(off, "HOPT")
+			}
+			if inh.Interfacility {
+				off = append(off, "HOPX")
+			}
+			pw = td.AddText(string(tcp)+" OFF: "+strings.Join(off, " "), pw, listStyle)
+			newline()
+		}
+	}
+
 	if (filter.All || filter.ActiveCRDAPairs) && !ps.CRDA.Disabled {
 		for i, crda := range ps.CRDA.RunwayPairState {
 			if !crda.Enabled {
@@ -882,7 +901,13 @@ func (sp *STARSPane) drawTABList(ctx *panes.Context, paneExtent math.Extent2D, s
 				return false
 			}
 
-			if ctx.UserOwnsFlightPlan(fp) {
+			// Departures are owned by their assigned position. Resolve list
+			// membership through the live consolidation via that position
+			// (below) rather than the OwningTCW baked at spawn, so a departure
+			// follows its owner as positions consolidate/split; otherwise it
+			// stays stuck in the list of whoever was the consolidation master
+			// when it spawned.
+			if fp.TypeOfFlight != av.FlightTypeDeparture && ctx.UserOwnsFlightPlan(fp) {
 				return true
 			}
 
@@ -1331,6 +1356,24 @@ func (sp *STARSPane) drawCoordinationLists(ctx *panes.Context, paneExtent math.E
 
 	var allBounds []math.Extent2D
 	fa := ctx.FacilityAdaptation
+
+	// Per airport, the set of owners that have a dedicated (owner-scoped) list.
+	// A catch-all list (no owner_tcp) shows only the remainder -- departures
+	// whose owner has no dedicated list -- so each departure lands in exactly
+	// one list.
+	dedicatedOwners := make(map[string]map[sim.TCP]bool)
+	for _, cl := range fa.Lists.Coordination {
+		if cl.OwnerTCP == "" {
+			continue
+		}
+		for _, ap := range cl.Airports {
+			if dedicatedOwners[ap] == nil {
+				dedicatedOwners[ap] = make(map[sim.TCP]bool)
+			}
+			dedicatedOwners[ap][cl.OwnerTCP] = true
+		}
+	}
+
 	for i, cl := range fa.Lists.Coordination {
 		listStyle := renderer.TextStyle{
 			Font:  font,
@@ -1367,6 +1410,16 @@ func (sp *STARSPane) drawCoordinationLists(ctx *panes.Context, paneExtent math.E
 				}
 
 				if !slices.Contains(cl.Airports, dep.DepartureAirport) {
+					return false
+				}
+				// An owner-scoped list shows only its owner's departures; a
+				// catch-all list shows the remainder -- departures whose owner
+				// has no dedicated list -- so each departure lands in one list.
+				if cl.OwnerTCP != "" {
+					if dep.DepartureController != cl.OwnerTCP {
+						return false
+					}
+				} else if dedicatedOwners[dep.DepartureAirport][dep.DepartureController] {
 					return false
 				}
 				for callsign, state := range sp.TrackState {

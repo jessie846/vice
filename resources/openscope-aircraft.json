@@ -11015,7 +11015,7 @@
       }
     },
     {
-      "name": "Embraer 120 Bras\u00edlia",
+      "name": "Embraer 120 Brasília",
       "icao": "E120",
       "engines": {
         "number": 2,
@@ -11179,7 +11179,7 @@
       }
     },
     {
-      "name": "Embraer 170",
+      "name": "Embraer 170/175",
       "icao": "E170",
       "engines": {
         "number": 2,
@@ -13668,6 +13668,92 @@
       "turn": {
         "maxBankAngle": 25,
         "maxBankRate": 5
+      }
+    },
+    {
+      "name": "ATR 42-600",
+      "icao": "AT46",
+      "engines": {
+        "number": 2,
+        "type": "T"
+      },
+      "weightClass": "L",
+      "category": {
+        "srs": 3,
+        "lahso": 3,
+        "cwt": "G"
+      },
+      "ceiling": 25000,
+      "rate": {
+        "climb": 1600,
+        "descent": 1800,
+        "accelerate": 5.9,
+        "decelerate": 3
+      },
+      "runway": {
+        "takeoff": 1.09,
+        "landing": 1.03
+      },
+      "speed": {
+        "min": 100,
+        "landing": 120,
+        "cruise": 299,
+        "cruiseM": null,
+        "max": 325,
+        "maxM": null
+      },
+      "capability": {
+        "ils": true,
+        "fix": true
+      },
+      "turn": {
+        "maxBankAngle": 25,
+        "maxBankRate": 5
+      }
+    },
+    {
+      "name": "CRJ 550",
+      "icao": "CRJ5",
+      "engines": {
+        "number": 2,
+        "type": "J"
+      },
+      "weightClass": "L",
+      "category": {
+        "srs": 3,
+        "lahso": 7,
+        "cwt": "G"
+      },
+      "ceiling": 41000,
+      "rate": {
+        "climb": 2600,
+        "descent": 2200,
+        "accelerate": 5.9,
+        "decelerate": 3
+      },
+      "runway": {
+        "takeoff": 1.7,
+        "landing": 1.48
+      },
+      "speed": {
+        "min": 110,
+        "landing": 135,
+        "cruise": 424,
+        "cruiseM": 0.76,
+        "max": 470,
+        "maxM": 0.8
+      },
+      "capability": {
+        "ils": true,
+        "fix": true
+      },
+      "turn": {
+        "maxBankAngle": 25,
+        "maxBankRate": 5
+      },
+      "capacity": {
+        "passengers": 50,
+        "fuel_pounds": 15000
       }
     }
   ]

@@ -2,141 +2,40 @@ package stt
 
 import (
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 
 	av "github.com/mmp/vice/aviation"
 )
 
-// ParseCommands parses tokens into a sequence of commands using the registered command templates.
-func ParseCommands(tokens []Token, ac Aircraft) ([]string, float64) {
-	logLocalStt("ParseCommands: %d tokens", len(tokens))
-	if len(tokens) == 0 {
-		return nil, 0
-	}
-
-	var commands []string
-	var totalConf float64
-	pos := 0
-	isThen := false
-	matchedAny := false                        // Track if any command pattern matched (including empty-command patterns)
-	excludeCategories := make(map[string]bool) // Track categories already matched
-
-	for pos < len(tokens) {
-		// Check for "then" keyword.
-		// Also treat "the" as "then" when followed by a command keyword and we
-		// already have at least one command — STT often garbles "then" as "the".
-		// Must check BEFORE filler word skip since "the" is a filler word.
-		if tokens[pos].Text == "then" || (len(commands) > 0 && tokens[pos].Text == "the" && pos+1 < len(tokens) &&
-			(tokens[pos+1].Text == "descend" || tokens[pos+1].Text == "climb" || tokens[pos+1].Text == "maintain")) {
-			logLocalStt("  found 'then' (or 'the' as then) at position %d", pos)
-			isThen = true
-			pos++
-			continue
-		}
-
-		// Skip filler words
-		if IsFillerWord(tokens[pos].Text) {
-			logLocalStt("  skipping filler word: %q", tokens[pos].Text)
-			pos++
-			continue
-		}
-
-		// Check for "at {altitude}" pattern - implicit "then" trigger
-		if tokens[pos].Text == "at" && pos+1 < len(tokens) && looksLikeAltitude(tokens[pos+1]) {
-			logLocalStt("  found 'at {altitude}' pattern at position %d, triggering then", pos)
-			isThen = true
-			pos += 2
-			continue
-		}
-
-		// Try to match a command
-		match, newPos := matchCommandNew(tokens, pos, ac, isThen, excludeCategories)
-		if newPos > pos {
-			logLocalStt("  matched command: %q (conf=%.2f, consumed=%d, isThen=%v)",
-				match.Command, match.Confidence, newPos-pos, isThen)
-			matchedAny = true
-			if match.Command != "" {
-				// A handler may emit multiple space-separated commands
-				// (e.g., "D{fix} A{fix}/I"). Split so each is tracked,
-				// categorized, and post-processed individually.
-				for _, cmd := range strings.Fields(match.Command) {
-					commands = append(commands, cmd)
-					totalConf += match.Confidence
-
-					if category := getCommandCategory(cmd); category != "" {
-						excludeCategories[category] = true
-					}
-
-					// If this is an expect approach command, add the approach's fixes
-					// to the aircraft context for subsequent command parsing.
-					if strings.HasPrefix(cmd, "E") && len(cmd) > 1 {
-						approachID := cmd[1:]
-						// Strip LAHSO suffix if present (e.g., "I22L/LAHSO26" -> "I22L")
-						if idx := strings.Index(approachID, "/LAHSO"); idx != -1 {
-							approachID = approachID[:idx]
-						}
-						if approachFixes, ok := ac.ApproachFixes[approachID]; ok {
-							logLocalStt("  adding %d fixes from approach %s to aircraft context", len(approachFixes), approachID)
-							if ac.Fixes == nil {
-								ac.Fixes = make(map[string]string)
-							}
-							for spoken, fix := range approachFixes {
-								if _, exists := ac.Fixes[spoken]; !exists {
-									ac.Fixes[spoken] = fix
-								}
-							}
-						}
-					}
-				}
-			}
-			pos = newPos
-			isThen = false
-		} else {
-			// Before skipping, check if tokens form an implicit approach reference
-			// (approach name without "expect" or "cleared" prefix)
-			if cmd, consumed := tryImplicitApproachMatch(tokens[pos:], ac); consumed > 0 {
-				logLocalStt("  implicit approach match: %q (consumed=%d)", cmd, consumed)
-				commands = append(commands, cmd)
-				totalConf += 1.0
-				pos += consumed
-				continue
-			}
-			logLocalStt("  no match at token[%d]=%q, skipping", pos, tokens[pos].Text)
-			pos++
-		}
-	}
-
-	if len(commands) == 0 {
-		if matchedAny {
-			// A command pattern matched but produced no output (e.g., "standby
-			// for the approach") — return empty commands with positive
-			// confidence so the caller doesn't treat this as a failed parse.
-			logLocalStt("ParseCommands: matched but no commands to issue")
-			return nil, 1
-		}
-		logLocalStt("ParseCommands: no commands found")
-		return nil, 0
-	}
-
-	// Post-processing: if "knots" appears in the transcript, convert altitude commands to speed
-	commands = convertAltitudeToSpeedIfKnots(tokens, commands)
-	commands = coalesceAfterFixAltitudes(commands)
-	commandsBeforeApprovalFilter := len(commands)
-	commands = removeCombinedApproved(commands)
-	totalConf -= float64(commandsBeforeApprovalFilter - len(commands))
-
-	avgConf := totalConf / float64(len(commands))
-	logLocalStt("ParseCommands: result=%v (avgConf=%.2f)", commands, avgConf)
-	return commands, avgConf
-}
-
 func removeCombinedApproved(commands []string) []string {
 	if len(commands) <= 1 {
 		return commands
 	}
 	return slices.DeleteFunc(commands, func(cmd string) bool { return cmd == "APPROVED" })
+}
+
+// resolveExpedite replaces the bare-"expedite" marker with EC or ED based on
+// the nearest preceding altitude command: a climb yields EC, otherwise ED
+// (descend, or the default when no altitude command precedes it).
+func resolveExpedite(commands []string) []string {
+	for i, cmd := range commands {
+		if cmd != "EXPEDITE" {
+			continue
+		}
+		dir := "ED"
+		for j := i - 1; j >= 0; j-- {
+			c := strings.TrimPrefix(commands[j], "T")
+			if len(c) > 1 && (c[0] == 'C' || c[0] == 'D' || c[0] == 'A') && IsNumber(c[1:]) {
+				if c[0] == 'C' {
+					dir = "EC"
+				}
+				break
+			}
+		}
+		commands[i] = dir
+	}
+	return commands
 }
 
 // convertAltitudeToSpeedIfKnots checks if "knots" appears anywhere in the tokens.
@@ -176,173 +75,6 @@ func convertAltitudeToSpeedIfKnots(tokens []Token, commands []string) []string {
 	return result
 }
 
-// matchCommandNew tries to match tokens against registered commands.
-// excludeCategories contains command categories that should not be matched
-// (because a command of that category was already matched in this transmission).
-func matchCommandNew(tokens []Token, startPos int, ac Aircraft, isThen bool, excludeCategories map[string]bool) (CommandMatch, int) {
-	var bestMatch CommandMatch
-	var bestPriority int
-	var bestSayAgain CommandMatch
-	var bestSayAgainPriority int
-
-	for _, cmd := range sttCommands {
-		match, endPos := tryMatchCommand(tokens, startPos, cmd, ac, isThen)
-		consumed := endPos - startPos
-		if consumed > 0 {
-			// Check if this command's category is excluded
-			category := getCommandCategory(match.Command)
-			if category != "" && excludeCategories[category] {
-				continue
-			}
-
-			if match.IsSayAgain {
-				if cmd.priority > bestSayAgainPriority || (cmd.priority == bestSayAgainPriority && consumed > bestSayAgain.Consumed) {
-					bestSayAgain = match
-					bestSayAgainPriority = cmd.priority
-				}
-			} else {
-				if cmd.priority > bestPriority || (cmd.priority == bestPriority && consumed > bestMatch.Consumed) {
-					bestMatch = match
-					bestPriority = cmd.priority
-				}
-			}
-		}
-	}
-
-	if bestMatch.Consumed > 0 {
-		return bestMatch, startPos + bestMatch.Consumed
-	}
-	if bestSayAgain.Consumed > 0 {
-		return bestSayAgain, startPos + bestSayAgain.Consumed
-	}
-	return CommandMatch{}, startPos
-}
-
-// tryMatchCommand attempts to match tokens against a single command template.
-func tryMatchCommand(tokens []Token, startPos int, cmd sttCommand, ac Aircraft, isThen bool) (CommandMatch, int) {
-	pos := startPos
-	var values []any
-	skipWords := extractSkipWords(cmd.template)
-
-	for i, m := range cmd.matchers {
-		// Only allow slack for non-first matchers in the template.
-		// The first keyword must match at or near the current position.
-		allowSlack := i > 0
-		res := m.match(tokens, pos, ac, skipWords, allowSlack)
-
-		if res.consumed == 0 {
-			// Non-optional matcher failed
-			if !m.isOptional() {
-				// Return SAYAGAIN if we've matched enough context and this command
-				// is marked for clarification on type parser failure.
-				// When the parser has tokens but can't match them, i > 0 suffices.
-				// When at end of tokens, require >1 consumed token to avoid false
-				// triggers from single stray keywords (e.g., "cleared" alone).
-				// Commands with sayAgainMinTokens require more tokens consumed
-				// (e.g., "at {fix} cleared {approach}" needs the fix to match).
-				minTokens := cmd.sayAgainMinTokens
-				if minTokens <= 0 {
-					minTokens = 1
-				}
-				enoughContext := pos-startPos >= minTokens && ((pos < len(tokens) && i > 0) || pos-startPos > 1)
-				if res.sayAgain != "" && enoughContext && cmd.sayAgainOnFail {
-					return CommandMatch{
-						Command:    "SAYAGAIN/" + res.sayAgain,
-						Confidence: 0.5,
-						Consumed:   pos - startPos,
-						IsSayAgain: true,
-					}, pos
-				}
-				return CommandMatch{}, startPos
-			}
-			// Optional matcher didn't match, that's ok
-			if _, ok := m.(*optionalGroupMatcher); ok {
-				// Add nil values for optional group parameters
-				for _, inner := range m.(*optionalGroupMatcher).matchers {
-					if _, isTM := inner.(*typedMatcher); isTM {
-						values = append(values, nil)
-					}
-				}
-			}
-		} else {
-			pos = res.consumed
-			if res.value != nil {
-				// Handle optional group values (slice of values)
-				if vals, ok := res.value.([]any); ok {
-					values = append(values, vals...)
-				} else {
-					values = append(values, res.value)
-				}
-			}
-		}
-	}
-
-	// Build command string by invoking handler
-	cmdStr := invokeHandler(cmd.handler, values, isThen, cmd.thenVariant)
-
-	return CommandMatch{
-		Command:    cmdStr,
-		Confidence: 1.0,
-		Consumed:   pos - startPos,
-		IsThen:     isThen,
-	}, pos
-}
-
-// invokeHandler calls the handler function with the extracted values.
-func invokeHandler(handler any, values []any, isThen bool, thenVariant string) string {
-	handlerVal := reflect.ValueOf(handler)
-	handlerType := handlerVal.Type()
-
-	// Build argument list
-	args := make([]reflect.Value, handlerType.NumIn())
-	valueIdx := 0
-
-	for i := 0; i < handlerType.NumIn(); i++ {
-		paramType := handlerType.In(i)
-
-		if valueIdx >= len(values) {
-			// Missing value - use zero value
-			args[i] = reflect.Zero(paramType)
-			continue
-		}
-
-		val := values[valueIdx]
-		valueIdx++
-
-		if val == nil {
-			// nil for optional parameters
-			args[i] = reflect.Zero(paramType)
-		} else if paramType.Kind() == reflect.Ptr {
-			// Pointer parameter (optional)
-			if val == nil {
-				args[i] = reflect.Zero(paramType)
-			} else {
-				ptr := reflect.New(paramType.Elem())
-				ptr.Elem().Set(reflect.ValueOf(val))
-				args[i] = ptr
-			}
-		} else {
-			// Regular parameter
-			args[i] = reflect.ValueOf(val)
-		}
-	}
-
-	// Call handler
-	results := handlerVal.Call(args)
-	cmdStr := results[0].String()
-
-	// Apply then variant if needed
-	if isThen && thenVariant != "" && cmdStr != "" {
-		// The thenVariant is a format string that transforms the command
-		// For simple cases, just prepend "T" to the command
-		if !strings.HasPrefix(cmdStr, "T") {
-			cmdStr = "T" + cmdStr
-		}
-	}
-
-	return cmdStr
-}
-
 // tryImplicitApproachMatch checks if tokens form an approach reference without an
 // explicit "expect" or "cleared" prefix. If so, it infers the command type:
 // - If no approach assigned → "E{approach}" (expect approach)
@@ -374,6 +106,105 @@ func tryImplicitApproachMatch(tokens []Token, ac Aircraft) (string, int) {
 	}
 
 	return prefix + appr, consumed
+}
+
+// mergeUntilFixMarkers folds "UNTILFIX/{fix}" markers ("maintain that
+// until Dennis") into the nearest preceding speed command as an
+// until-fix restriction: S180 + UNTILFIX/DNNIS -> S180/UDNNIS. A marker
+// with no speed command to modify is dropped.
+func mergeUntilFixMarkers(commands []string) []string {
+	for i := 0; i < len(commands); i++ {
+		fix, ok := strings.CutPrefix(commands[i], "UNTILFIX/")
+		if !ok {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			if len(commands[j]) > 1 && commands[j][0] == 'S' && IsNumber(commands[j][1:]) {
+				logLocalStt("  merged until-fix: %s + %s -> %s/U%s", commands[j], commands[i], commands[j], fix)
+				commands[j] += "/U" + fix
+				break
+			}
+		}
+		commands = slices.Delete(commands, i, i+1)
+		i--
+	}
+	return commands
+}
+
+// dropFixSayAgainBeforeClearance removes a SAYAGAIN/FIX request when the
+// same transmission also contains an approach clearance: "direct
+// {unrecognized} cleared River Visual" — the clearance defines the
+// routing, so asking for the fix again is unhelpful.
+func dropFixSayAgainBeforeClearance(commands []string) []string {
+	hasClearance := slices.ContainsFunc(commands, func(cmd string) bool {
+		return len(cmd) > 1 && cmd[0] == 'C' && cmd != "CVS" && cmd != "CAC" &&
+			!IsNumber(cmd[1:]) && !strings.Contains(cmd, "/")
+	})
+	if !hasClearance {
+		return commands
+	}
+	return slices.DeleteFunc(commands, func(cmd string) bool { return cmd == "SAYAGAIN/FIX" })
+}
+
+// resolveGarbledClearanceVerb converts an approach clearance to an
+// expect-approach when the aircraft has no assigned approach and the word
+// "cleared" was never actually spoken (the clearance verb was recovered
+// from a garble like "clicked"). ATC assigns approaches expect-first, so
+// with nothing on file a clearance with an unintelligible verb is almost
+// certainly the expect leg; an explicit "cleared" is honored as spoken.
+func resolveGarbledClearanceVerb(tokens []Token, commands []string, ac Aircraft) []string {
+	if ac.AssignedApproach != "" {
+		return commands
+	}
+	for i, cmd := range commands {
+		if getCommandCategory(cmd) != "cleared_approach" || cmd == "CVS" || cmd == "CAC" ||
+			strings.Contains(cmd, "/") || strings.HasPrefix(cmd, "CSI") {
+			continue
+		}
+		if slices.ContainsFunc(tokens, func(t Token) bool {
+			return strings.EqualFold(t.Text, "cleared") || strings.EqualFold(t.Text, "clear")
+		}) {
+			return commands
+		}
+		logLocalStt("  garbled clearance verb with no assigned approach: %s -> E%s", cmd, cmd[1:])
+		commands[i] = "E" + cmd[1:]
+	}
+	return commands
+}
+
+// dedupeRepeatedHeadings keeps only the last of multiple absolute heading
+// commands in one transmission: a controller restating a heading ("right
+// heading two seven zero, ah, right heading zero nine zero") is
+// correcting the earlier one, not issuing two turns. Sequential turns are
+// spoken with "then" and parse as T-prefixed commands, which are left
+// alone.
+func dedupeRepeatedHeadings(commands []string) []string {
+	last := -1
+	count := 0
+	for i, cmd := range commands {
+		if isAbsoluteHeadingCommand(cmd) {
+			last = i
+			count++
+		}
+	}
+	if count < 2 {
+		return commands
+	}
+	logLocalStt("  repeated heading commands: keeping only %s", commands[last])
+	out := commands[:0]
+	for i, cmd := range commands {
+		if !isAbsoluteHeadingCommand(cmd) || i == last {
+			out = append(out, cmd)
+		}
+	}
+	return out
+}
+
+// isAbsoluteHeadingCommand reports whether cmd assigns an absolute
+// heading (H270, L090, R110) as opposed to a relative turn or a
+// direct-to-fix.
+func isAbsoluteHeadingCommand(cmd string) bool {
+	return len(cmd) >= 2 && (cmd[0] == 'H' || cmd[0] == 'L' || cmd[0] == 'R') && IsNumber(cmd[1:])
 }
 
 // coalesceAfterFixAltitudes transforms bare altitude commands that follow a

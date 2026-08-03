@@ -3643,7 +3643,7 @@
         },
         {
           "boundaries": ["PHL_NH27_6_W"],
-          "lower": 13000,
+          "lower": 9000,
           "upper": 13000
         },
         {
@@ -4169,6 +4169,11 @@
         },
         {
           "boundaries": ["PHL_SH27_50_NW"],
+          "lower": 11000,
+          "upper": 12000
+        },
+        {
+          "boundaries": ["PHL_SD27_50_45"],
           "lower": 11000,
           "upper": 12000
         },

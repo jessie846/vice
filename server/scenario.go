@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -22,6 +23,7 @@ import (
 
 	av "github.com/mmp/vice/aviation"
 	"github.com/mmp/vice/brief"
+	"github.com/mmp/vice/enroute"
 	"github.com/mmp/vice/log"
 	"github.com/mmp/vice/math"
 	"github.com/mmp/vice/sim"
@@ -61,6 +63,11 @@ type scenarioGroup struct {
 	// not from the scenario group JSON.
 	FacilityConfig sim.FacilityConfig `json:"-"`
 
+	// ERAMCoordination is the resolved pseudo-ERAM adaptation for this
+	// facility's TRACON computer id, loaded from the ERAM host (ARTCC)
+	// config. Nil if none is adapted.
+	ERAMCoordination *enroute.Coordination `json:"-"`
+
 	SourceFile string // path of the JSON file this was loaded from
 }
 
@@ -72,6 +79,11 @@ type scenario struct {
 	// ControllerConfiguration is the runtime-resolved configuration data,
 	// populated during PostDeserialize from ConfigurationString.
 	ControllerConfiguration sim.ControllerConfiguration `json:"-"`
+
+	// DefaultConsolidation optionally overrides the referenced facility
+	// configuration's consolidation tree. When empty, the facility
+	// configuration's is used.
+	DefaultConsolidation sim.PositionConsolidation `json:"default_consolidation,omitempty"`
 
 	// VirtualControllers is auto-derived at runtime from the facility config
 	// and scenario routes; it is NOT read from JSON.
@@ -124,7 +136,17 @@ func (s *scenario) PostDeserialize(sg *scenarioGroup, e *util.ErrorLogger, mapSp
 		s.ControllerConfiguration.InboundAssignments = maps.Clone(config.InboundAssignments)
 		s.ControllerConfiguration.DepartureAssignments = maps.Clone(config.DepartureAssignments)
 		s.ControllerConfiguration.GoAroundAssignments = maps.Clone(config.GoAroundAssignments)
-		s.ControllerConfiguration.DefaultConsolidation = deep.MustCopy(config.DefaultConsolidation)
+
+		// A scenario may override the facility configuration's consolidation
+		// tree; otherwise fall back to the configuration's. A scenario-provided
+		// override is validated the same way facility configurations are (the
+		// fallback was already validated at config load).
+		if len(s.DefaultConsolidation) > 0 {
+			s.DefaultConsolidation.Validate(sg.FacilityConfig.ControlPositions, e)
+			s.ControllerConfiguration.DefaultConsolidation = deep.MustCopy(s.DefaultConsolidation)
+		} else {
+			s.ControllerConfiguration.DefaultConsolidation = deep.MustCopy(config.DefaultConsolidation)
+		}
 
 		// Auto-add airspace controllers to consolidation if they're valid
 		// control positions but missing from the consolidation tree.
@@ -245,12 +267,9 @@ func (s *scenario) PostDeserialize(sg *scenarioGroup, e *util.ErrorLogger, mapSp
 			s.VirtualControllers = append(s.VirtualControllers, tcp)
 		}
 	}
-	addControllersFromWaypoints := func(route []av.Waypoint) {
-		for _, wp := range route {
-			addController(sim.TCP(wp.HandoffController()))
-			for _, group := range wp.ActionGroups() {
-				addController(sim.TCP(group.Actions.HandoffController))
-			}
+	addControllersFromWaypoints := func(route av.WaypointArray) {
+		for _, tcp := range route.HandoffControllers() {
+			addController(sim.TCP(tcp))
 		}
 	}
 	// Make sure all of the controllers used in airspace awareness will be there.
@@ -287,14 +306,18 @@ func (s *scenario) PostDeserialize(sg *scenarioGroup, e *util.ErrorLogger, mapSp
 				}
 			}
 
-			if len(ap.Departures) == 0 {
-				e.ErrorString(`no "departures" specified for airport`)
-			}
-
+			// An airport with no "departures" is authored for published traffic
+			// only; its exits then come from "departure_routes" alone.
 			if rwy.Category != "" {
-				found := slices.ContainsFunc(ap.Departures, func(dep av.Departure) bool {
-					return ap.ExitCategories[dep.Exit] == rwy.Category
-				})
+				var found bool
+				if len(ap.Departures) > 0 {
+					found = slices.ContainsFunc(ap.Departures, func(dep av.Departure) bool {
+						return ap.ExitCategories[dep.Exit] == rwy.Category
+					})
+				} else {
+					found = util.SeqContainsFunc(maps.Keys(ap.DepartureRoutes[rwy.Runway]),
+						func(exit av.ExitID) bool { return ap.ExitCategories[exit] == rwy.Category })
+				}
 				if !found {
 					e.ErrorString("no departures have exit category %q", rwy.Category)
 				}
@@ -551,7 +574,7 @@ func (s *scenario) PostDeserialize(sg *scenarioGroup, e *util.ErrorLogger, mapSp
 						// arrivals in the group.
 						found := false
 						for _, ar := range flow.Arrivals {
-							if _, ok := ar.Airlines[airport]; ok {
+							if slices.Contains(ar.ServedAirports(), airport) {
 								found = true
 
 								// Make sure the airport has at least one
@@ -629,21 +652,9 @@ func (sg *scenarioGroup) Locate(s string) (math.Point2LL, bool) {
 	// ScenarioGroup's definitions take precedence...
 	if p, ok := sg.Fixes[s]; ok {
 		return p, true
-	} else if n, ok := av.DB.Navaids[s]; ok {
-		return n.Location, ok
-	} else if ap, ok := av.DB.LookupAirport(s); ok {
-		return ap.Location, ok
-	} else if f, ok := av.DB.Fixes[s]; ok {
-		return f.Location, ok
-	} else if p, err := math.ParseLatLong([]byte(s)); err == nil {
-		return p, true
-	} else if len(s) > 5 && s[4] == '-' {
-		if rwy, ok := av.LookupRunway(s[:4], s[5:]); ok {
-			return rwy.Threshold, true
-		}
 	}
-
-	return math.Point2LL{}, false
+	//... and then the static database.
+	return enroute.DBLocator{}.Locate(s)
 }
 
 func (sg *scenarioGroup) LocateDME(s string) (math.Point2LL, int, bool) {
@@ -857,6 +868,66 @@ func makePolygonAirportFilters(id string, description string, delta float32,
 	return regions
 }
 
+// resolveERAMCoordination returns this TRACON's pseudo-ERAM coordination
+// adaptation from its parent ARTCC host config, keyed by the TRACON's STARS
+// computer id (its stars_id in the ARTCC's handoff_ids). configs holds all
+// the facility configs, loaded — with any coordination geometry parsed and
+// validated — before scenario groups are processed; the result is shared
+// read-only. An ARTCC-primary scenario self-hosts: its own config's
+// arts_coordination entry keyed by the ARTCC's id covers flights inbound
+// from adjacent centers. Returns nil for facilities whose host adapts no
+// coordination for them.
+func resolveERAMCoordination(sg *scenarioGroup, configs map[string]*sim.FacilityConfig) *enroute.Coordination {
+	if sg.TRACON == "" || sg.TRACON == sg.ARTCC {
+		// ARTCC-primary: the center's coordination is adapted in its own
+		// config under its own facility id.
+		afc := configs[configurationsPath(sg.ARTCC, sg.ARTCC)]
+		if afc == nil {
+			return nil
+		}
+		entry, ok := afc.FacilityAdaptation.ArtsCoordination[sg.ARTCC]
+		if !ok {
+			return nil
+		}
+		return &enroute.Coordination{
+			ComputerID:   sg.ARTCC,
+			Coord:        entry,
+			Restrictions: afc.FacilityAdaptation.Restrictions,
+		}
+	}
+	// TRACON scenarios frequently omit "artcc"; derive the host ARTCC.
+	artcc := sg.ARTCC
+	if artcc == "" {
+		artcc = av.DB.ARTCCForFacility(sg.TRACON)
+	}
+	if artcc == "" {
+		return nil
+	}
+	afc := configs[configurationsPath(artcc, artcc)]
+	if afc == nil {
+		return nil
+	}
+	// The TRACON's computer id is its stars_id in the ARTCC's handoff_ids;
+	// a TRACON the host has no handoff id for (e.g. the fictional Academy
+	// facility) is keyed by its own id.
+	computerID := sg.TRACON
+	for _, hid := range afc.HandoffIDs {
+		if hid.ID == sg.TRACON {
+			computerID = hid.StarsID
+			break
+		}
+	}
+	entry, ok := afc.FacilityAdaptation.ArtsCoordination[computerID]
+	if !ok {
+		return nil
+	}
+	return &enroute.Coordination{
+		ComputerID:   computerID,
+		Coord:        entry,
+		Restrictions: afc.FacilityAdaptation.Restrictions,
+	}
+}
+
 func (sg *scenarioGroup) PostDeserialize(e *util.ErrorLogger, catalogs map[string]map[string]*ScenarioCatalog,
 	mapSpec *av.MapLibrarySpec, mapSpecs map[string]*av.MapLibrarySpec) {
 	defer e.CheckDepth(e.CurrentDepth())
@@ -1053,6 +1124,9 @@ func (sg *scenarioGroup) PostDeserialize(e *util.ErrorLogger, catalogs map[strin
 		ap.PostDeserialize(name, sg, sg.NmPerLongitude, sg.MagneticVariation,
 			sg.FacilityConfig.ControlPositions, sg.FacilityConfig.FacilityAdaptation.Scratchpads, sg.Airports,
 			sg.FacilityConfig.FacilityAdaptation.CheckScratchpad, e)
+		if _, ok := av.DB.AirportTimeZones[name]; !ok {
+			e.ErrorString("no time zone for this airport; add it to resources/airport-timezones.json")
+		}
 		e.Pop()
 	}
 
@@ -1296,6 +1370,23 @@ func (sg *scenarioGroup) rewriteControllers(e *util.ErrorLogger) {
 		for spec, tcp := range config.GoAroundAssignments {
 			rewriteControlPosition(&tcp)
 			config.GoAroundAssignments[spec] = tcp
+		}
+	}
+	// Rewrite the owning TCPs in fix-pair assignment rows, first normalizing
+	// any short-prefix neighbor references to their canonical form.
+	// (Reassignment rules and arts_coordination reference only fixes, not
+	// positions.)
+	if fpc := fa.FixPairConfiguration; fpc != nil {
+		for _, rows := range [][]sim.FixPairAssignmentRow{
+			fpc.Assignments.Arrival, fpc.Assignments.Departure, fpc.Assignments.Overflight,
+		} {
+			for i := range rows {
+				for plan, tcp := range rows[i].TCP {
+					tcp = sg.resolveController(tcp)
+					rewriteControlPosition(&tcp)
+					rows[i].TCP[plan] = tcp
+				}
+			}
 		}
 	}
 
@@ -1563,20 +1654,19 @@ func PostDeserializeFacilityAdaptation(s *sim.FacilityAdaptation, e *util.ErrorL
 		}
 
 		if hfr {
-			// Make sure it's in either zero or one of the coordination lists.
-			if len(matches) > 1 {
-				e.ErrorString(`Airport %q is in multiple entries in "coordination_lists": %s.`, airport, strings.Join(matches, ", "))
-			}
+			// An airport may appear in several coordination lists when they are
+			// split by "owner_tcp"; facility validation forbids genuinely
+			// overlapping coverage.
 		} else if len(matches) != 0 {
 			// And it shouldn't be any if it's not hold for release
-			e.ErrorString(`Airport %q isn't "hold_for_release" but is in "coordination_lists": %s.`, airport,
+			e.ErrorString(`Airport %q isn't "hold_for_release" but is in "lists.coordination": %s.`, airport,
 				strings.Join(matches, ", "))
 		}
 	}
 
 	// Coordination list airports (require sg.Airports).
 	for _, list := range s.Lists.Coordination {
-		e.Push(`"coordination_lists" ` + list.Name)
+		e.Push(`"lists.coordination" ` + list.Name)
 		for _, ap := range list.Airports {
 			if _, ok := sg.Airports[ap]; !ok {
 				e.ErrorString("Airport %q not defined in scenario group.", ap)
@@ -1723,6 +1813,8 @@ func initializeSimConfigurations(sg *scenarioGroup, catalogs map[string]map[stri
 			func(cc *sim.STARSController) bool { return len(cc.FlightFollowingAirspace) > 0 })
 		lc := sim.MakeLaunchConfig(scenario.DepartureRunways, *scenario.VFRRateScale, *scenario.VFFRequestRate,
 			vfrAirports, scenario.InboundFlowDefaultRates, haveVFRReportingRegions)
+		sim.MarkBackgroundTraffic(sg.Airports, sg.InboundFlows, &scenario.ControllerConfiguration,
+			sg.FacilityConfig.ControlPositions, &lc)
 
 		spec := &ScenarioSpec{
 			ControllerConfiguration: &scenario.ControllerConfiguration,
@@ -1734,6 +1826,9 @@ func initializeSimConfigurations(sg *scenarioGroup, catalogs map[string]map[stri
 			MagneticVariation:       sg.MagneticVariation,
 			WindSpecifier:           scenario.WindSpecifier,
 		}
+		if canGenerateScenarioTraffic(sg, &lc) {
+			spec.TrafficSources = append(spec.TrafficSources, sim.TrafficSourceScenario)
+		}
 
 		catalog.Scenarios[name] = spec
 	}
@@ -1743,6 +1838,95 @@ func initializeSimConfigurations(sg *scenarioGroup, catalogs map[string]map[stri
 			catalogs[facility] = make(map[string]*ScenarioCatalog)
 		}
 		catalogs[facility][sg.Name] = catalog
+	}
+}
+
+// canGenerateScenarioTraffic reports whether the scenario has the airline lists
+// its own traffic generator samples from. They are optional; without them the
+// scenario can only be flown from a timetable or historical data, which bring
+// their own callsigns and aircraft types.
+func canGenerateScenarioTraffic(sg *scenarioGroup, lc *sim.LaunchConfig) bool {
+	for airport := range lc.DepartureRates {
+		ap, ok := sg.Airports[airport]
+		if !ok {
+			return false
+		}
+		if !slices.ContainsFunc(ap.Departures,
+			func(dep av.Departure) bool { return len(dep.Airlines) > 0 }) {
+			return false
+		}
+	}
+
+	for flow, airports := range lc.InboundFlowRates {
+		inboundFlow, ok := sg.InboundFlows[flow]
+		if !ok {
+			return false
+		}
+		for airport := range airports {
+			if airport == "overflights" {
+				continue // overflights always come from the scenario's own airlines
+			}
+			if !slices.ContainsFunc(inboundFlow.Arrivals,
+				func(arr av.Arrival) bool { return len(arr.Airlines[airport]) > 0 }) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func attachTimetables(catalogs map[string]map[string]*ScenarioCatalog, timetables sim.TimetableCatalog) {
+	for _, facilityCatalogs := range catalogs {
+		for _, catalog := range facilityCatalogs {
+			for _, scenario := range catalog.Scenarios {
+				scenario.Timetables = timetables.SummariesForAirport(scenario.PrimaryAirport)
+				if len(scenario.Timetables) > 0 {
+					scenario.TrafficSources = append(scenario.TrafficSources, sim.TrafficSourceTimetable)
+				}
+			}
+		}
+	}
+}
+
+// attachHistoricalFlightIntervals records the range of times each facility has
+// historical flight data for, so that the client can offer start times the data
+// actually covers.
+func attachHistoricalFlightIntervals(catalogs map[string]map[string]*ScenarioCatalog) {
+	resources := util.GetResourcesFS()
+	for facility, facilityCatalogs := range catalogs {
+		interval, err := av.FacilityFlightInterval(resources, facility)
+		if err != nil || interval.Start().IsZero() {
+			continue
+		}
+		for _, catalog := range facilityCatalogs {
+			for _, scenario := range catalog.Scenarios {
+				scenario.HistoricalFlightInterval = interval
+				scenario.TrafficSources = append(scenario.TrafficSources, sim.TrafficSourceHistorical)
+			}
+		}
+	}
+}
+
+// finalizeTrafficSources settles which source each scenario starts on, once
+// every source has had its say. A scenario with nothing at all to fly is a
+// scenario file that needs fixing.
+func finalizeTrafficSources(catalogs map[string]map[string]*ScenarioCatalog, e *util.ErrorLogger) {
+	for facility, facilityCatalogs := range catalogs {
+		for name, catalog := range facilityCatalogs {
+			for scenarioName, scenario := range catalog.Scenarios {
+				if len(scenario.TrafficSources) == 0 {
+					e.ErrorString("%s/%s/%s: no traffic source can fly this scenario: it gives no "+
+						"airlines and the facility has neither historical flight data nor a timetable",
+						facility, name, scenarioName)
+					continue
+				}
+				slices.Sort(scenario.TrafficSources)
+				if !slices.Contains(scenario.TrafficSources, scenario.LaunchConfig.TrafficSource) {
+					scenario.LaunchConfig.TrafficSource = scenario.TrafficSources[0]
+				}
+			}
+		}
 	}
 }
 
@@ -1815,6 +1999,12 @@ func facilityConfigPath(sg *scenarioGroup) string {
 	if artcc == "" {
 		artcc = av.DB.ARTCCForFacility(sg.TRACON)
 	}
+	return configurationsPath(artcc, facility)
+}
+
+// configurationsPath returns the path of facility's configuration file, which
+// lives in its ARTCC's directory.
+func configurationsPath(artcc, facility string) string {
 	return "configurations/" + artcc + "/" + facility + ".json"
 }
 
@@ -2225,6 +2415,7 @@ func LoadScenarioGroups(extraScenarioFilename string, extraVideoMapFilename stri
 	})
 
 	configErrs := make([]util.ErrorLogger, len(configItems))
+	loadedConfigs := make([]*sim.FacilityConfig, len(configItems))
 	eg = &errgroup.Group{}
 	eg.SetLimit(runtime.NumCPU())
 	for i, it := range configItems {
@@ -2233,16 +2424,53 @@ func LoadScenarioGroups(extraScenarioFilename string, extraVideoMapFilename stri
 			if fc != nil {
 				fc.PostDeserialize(it.path, &configErrs[i])
 			}
+			loadedConfigs[i] = fc
 			return nil
 		})
 	}
 	eg.Wait()
+
+	// All of the loaded facility configs, by path; the phases below resolve
+	// cross-facility references (a TRACON's host ARTCC adaptation, neighbor
+	// controllers) against this rather than reloading anything.
+	facilityConfigs := make(map[string]*sim.FacilityConfig)
+	for i, it := range configItems {
+		if loadedConfigs[i] != nil {
+			facilityConfigs[it.path] = loadedConfigs[i]
+		}
+	}
 
 	for i := range configErrs {
 		e.MergeFrom(&configErrs[i])
 	}
 	if err != nil {
 		e.Error(err)
+	}
+
+	// Every facility config lives in its ARTCC's directory, and the ARTCC
+	// must have a config of its own there: TRACONs resolve their pseudo-ERAM
+	// coordination through it.
+	missingARTCC := make(map[string]bool)
+	for _, it := range configItems {
+		artcc := path.Base(path.Dir(it.path))
+		if artccPath := configurationsPath(artcc, artcc); !missingARTCC[artcc] {
+			if _, ok := facilityConfigs[artccPath]; !ok {
+				missingARTCC[artcc] = true
+				e.ErrorString("%s: no config for the ARTCC itself", artccPath)
+			}
+		}
+	}
+
+	// Parse pseudo-ERAM coordination geometry once, so that TRACON scenario
+	// groups can share it read-only (see resolveERAMCoordination). This is
+	// the host ARTCC's data, so it resolves against the nav database alone
+	// rather than any scenario group's fixes.
+	for _, it := range configItems {
+		if fc := facilityConfigs[it.path]; fc != nil && len(fc.FacilityAdaptation.ArtsCoordination) > 0 {
+			e.Push("Facility config " + it.path)
+			enroute.ParseGeometry(fc.FacilityAdaptation.ArtsCoordination, fc.FacilityAdaptation.Restrictions, enroute.DBLocator{}, e)
+			e.Pop()
+		}
 	}
 
 	// Phase 2: Attach validated configs to scenario groups and load
@@ -2256,6 +2484,7 @@ func LoadScenarioGroups(extraScenarioFilename string, extraVideoMapFilename stri
 			}
 
 			sg.FacilityConfig = *deep.MustCopy(fc)
+			sg.ERAMCoordination = resolveERAMCoordination(sg, facilityConfigs)
 
 			// Add missing airports referenced by altimeters and coordination
 			// lists from sibling scenario groups. The facility config is
@@ -2394,6 +2623,7 @@ func LoadScenarioGroups(extraScenarioFilename string, extraVideoMapFilename stri
 			extraE.ErrorString("no mapSpec for video map %q found. Options: %s", vf,
 				strings.Join(util.SortedMapKeys(mapSpecs), ", "))
 		} else {
+			extraScenario.ERAMCoordination = resolveERAMCoordination(extraScenario, facilityConfigs)
 			extraScenario.PostDeserialize(&extraE, localCatalogs, mapSpec, mapSpecs)
 		}
 
@@ -2473,6 +2703,15 @@ func LoadScenarioGroups(extraScenarioFilename string, extraVideoMapFilename stri
 
 	loadEmergencies(e)
 
+	timetableCatalog, err := sim.LoadBuiltinTimetables()
+	if err != nil {
+		e.Error(err)
+	} else {
+		attachTimetables(catalogs, timetableCatalog)
+	}
+	attachHistoricalFlightIntervals(catalogs)
+	finalizeTrafficSources(catalogs, e)
+
 	lg.Infof("LoadScenarioGroups total: %s", time.Since(start))
 	return scenarioGroups, catalogs, mapSpecs, briefs, extraScenarioErrors
 }
@@ -2516,31 +2755,6 @@ func LookupScenario(tracon, scenarioName string, scenarioGroups map[string]map[s
 	return nil, nil, fmt.Errorf("scenario not found: %s/%s", tracon, scenarioName)
 }
 
-// CreateLaunchConfig creates a properly initialized LaunchConfig from scenario data
-func CreateLaunchConfig(scenario *scenario, scenarioGroup *scenarioGroup) sim.LaunchConfig {
-	// Create VFR airports map
-	vfrAirports := make(map[string]*av.Airport)
-	for name, ap := range scenarioGroup.Airports {
-		if ap.VFRRateSum() > 0 {
-			vfrAirports[name] = ap
-		}
-	}
-
-	// Check for VFR reporting regions
-	haveVFRReportingRegions := util.SeqContainsFunc(maps.Values(scenarioGroup.FacilityConfig.FacilityAdaptation.Controllers),
-		func(cfg *sim.STARSController) bool { return cfg.FlightFollowingAirspace != nil })
-
-	// Create proper LaunchConfig
-	return sim.MakeLaunchConfig(
-		scenario.DepartureRunways,
-		*scenario.VFRRateScale,
-		*scenario.VFFRequestRate,
-		vfrAirports,
-		scenario.InboundFlowDefaultRates,
-		haveVFRReportingRegions,
-	)
-}
-
 // CreateNewSimConfiguration creates a NewSimConfiguration from scenario components
 func CreateNewSimConfiguration(catalog *ScenarioCatalog, scenarioGroup *scenarioGroup, scenarioName string) (*sim.NewSimConfiguration, error) {
 	scenario, ok := scenarioGroup.Scenarios[scenarioName]
@@ -2556,7 +2770,7 @@ func CreateNewSimConfiguration(catalog *ScenarioCatalog, scenarioGroup *scenario
 	newSimConfig := &sim.NewSimConfiguration{
 		Facility:                scenarioGroup.TRACON,
 		Description:             scenarioName,
-		LaunchConfig:            CreateLaunchConfig(scenario, scenarioGroup),
+		LaunchConfig:            simConfig.LaunchConfig,
 		DepartureRunways:        simConfig.DepartureRunways,
 		ArrivalRunways:          simConfig.ArrivalRunways,
 		PrimaryAirport:          simConfig.PrimaryAirport,
@@ -2582,14 +2796,7 @@ func CreateNewSimConfiguration(catalog *ScenarioCatalog, scenarioGroup *scenario
 		ControllerAirspace:      scenario.Airspace,
 		VirtualControllers:      scenario.VirtualControllers,
 		HandoffIDs:              scenarioGroup.FacilityConfig.HandoffIDs,
-		FixPairs:                scenarioGroup.FacilityConfig.FixPairs,
-	}
-
-	// Resolve fix pair assignments from the selected configuration
-	if scenario.ConfigurationString != "" {
-		if config, ok := scenarioGroup.FacilityConfig.FacilityAdaptation.Configurations[scenario.ConfigurationString]; ok {
-			newSimConfig.FixPairAssignments = config.FixPairAssignments
-		}
+		ERAMCoordination:        scenarioGroup.ERAMCoordination,
 	}
 
 	// LoadScenarioGroups already validated emergencies.json; re-parse to hand the list to the sim.

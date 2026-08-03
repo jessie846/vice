@@ -11,6 +11,7 @@ import (
 	"time"
 
 	av "github.com/mmp/vice/aviation"
+	"github.com/mmp/vice/enroute"
 	"github.com/mmp/vice/log"
 	"github.com/mmp/vice/math"
 	"github.com/mmp/vice/rand"
@@ -44,11 +45,25 @@ type DynamicState struct {
 
 	ATPAEnabled     bool                                   // True if ATPA is enabled system-wide
 	ATPAVolumeState map[string]map[string]*ATPAVolumeState // airport -> volumeId -> state
+
+	// Automatic handoff processing (AHOP) inhibits: site-wide (STARS 8.8,
+	// p. 8-13) and per-TCP (STARS 4.3, p. 4-30). TCPs with nothing inhibited
+	// are absent from the map.
+	AutoHandoffSiteInhibited bool
+	AutoHandoffTCPInhibits   map[ControlPosition]AutoHandoffInhibit
 }
 
 type ATPAVolumeState struct {
 	Disabled          bool
 	Reduced25Disabled bool
+}
+
+// AutoHandoffInhibit records which categories of automatic handoff processing
+// a TCP has inhibited (STARS 4.3, p. 4-30). The two are reported separately in
+// the SSA as "HOPT" and "HOPX".
+type AutoHandoffInhibit struct {
+	Intrafacility bool
+	Interfacility bool
 }
 
 // CommonState represents the sim state that is both used server side and client-side.
@@ -79,6 +94,10 @@ type CommonState struct {
 	ScenarioDefaultVideoGroup string
 
 	FacilityAdaptation FacilityAdaptation
+	// ERAMCoordination is the pseudo-ERAM adaptation this sim uses to derive
+	// entry/exit fixes, resolved at load from the ERAM host (ARTCC) config for
+	// this facility's TRACON computer id. Nil if none is adapted.
+	ERAMCoordination *enroute.Coordination
 
 	Facility          string
 	MagneticVariation float32
@@ -163,18 +182,8 @@ func makeDerivedState(s *Sim) DerivedState {
 		}
 
 		var approach string
-		var approachFixes []string
 		if ac.Nav.Approach.Assigned != nil {
 			approach = ac.Nav.Approach.Assigned.FullName
-			seen := make(map[string]bool)
-			for _, wps := range ac.Nav.Approach.Assigned.Waypoints {
-				for _, wp := range wps {
-					if len(wp.Fix) >= 3 && len(wp.Fix) <= 5 && wp.Fix[0] != '_' && !seen[wp.Fix] {
-						seen[wp.Fix] = true
-						approachFixes = append(approachFixes, wp.Fix)
-					}
-				}
-			}
 		}
 
 		rt := Track{
@@ -195,7 +204,6 @@ func makeDerivedState(s *Sim) DerivedState {
 			Approach:                  approach,
 			Fixes:                     ac.GetSTTFixes(av.DB.IsARTCC(s.State.Facility)),
 			RouteFixes:                ac.GetRouteFixes(),
-			AssignedApproachFixes:     approachFixes,
 			ExpectedDirectFix:         ac.Nav.ExpectedDirectFix,
 			SID:                       ac.SID,
 			STAR:                      ac.STAR,
@@ -210,6 +218,14 @@ func makeDerivedState(s *Sim) DerivedState {
 		if perf, ok := av.DB.AircraftPerformance[ac.FlightPlan.AircraftType]; ok {
 			rt.CWTCategory = perf.Category.CWT
 		}
+
+		// Assigned heading/speed from nav, for STT intent inference. A speed
+		// restriction may be in knots or mach; carry each in its own field
+		// and its own units (mach in hundredths, matching the STT M command).
+		if ac.Nav.Heading.Assigned != nil {
+			rt.AssignedHeading = int(*ac.Nav.Heading.Assigned)
+		}
+		rt.AssignedSpeed, rt.AssignedMach = assignedSpeedForSTT(ac.Nav.Speed.Assigned)
 
 		for _, wp := range ac.Nav.Waypoints {
 			rt.Route = append(rt.Route, wp.Location)
@@ -255,6 +271,8 @@ func newCommonState(config NewSimConfiguration, startTime time.Time, model *wx.M
 
 			ATPAEnabled:     true,
 			ATPAVolumeState: initATPAVolumeState(config.Airports),
+
+			AutoHandoffTCPInhibits: make(map[ControlPosition]AutoHandoffInhibit),
 		},
 
 		ScenarioBrief: config.Brief,
@@ -279,6 +297,7 @@ func newCommonState(config NewSimConfiguration, startTime time.Time, model *wx.M
 		ScenarioDefaultVideoGroup: config.DefaultMapGroup,
 
 		FacilityAdaptation: deep.MustCopy(config.FacilityAdaptation),
+		ERAMCoordination:   config.ERAMCoordination,
 
 		Facility:          config.Facility,
 		MagneticVariation: config.MagneticVariation,
@@ -479,6 +498,14 @@ func (ss *CommonState) TCWForPosition(pos ControlPosition) TCW {
 	return TCW(pos) // it may be a center or external controller, etc.
 }
 
+// AutoHandoffInhibitedForTCW reports whether intrafacility automatic handoff
+// processing is inhibited for the tracks owned by the given TCW, either
+// site-wide (STARS 8.8) or for its primary TCP (STARS 4.3).
+func (ss *CommonState) AutoHandoffInhibitedForTCW(tcw TCW) bool {
+	return ss.AutoHandoffSiteInhibited ||
+		ss.AutoHandoffTCPInhibits[ss.PrimaryPositionForTCW(tcw)].Intrafacility
+}
+
 // PrimaryPositionForTCW returns the primary position for the given TCW.
 // Returns the TCW as position if no consolidation state exists or if Primary is empty.
 func (ss *CommonState) PrimaryPositionForTCW(tcw TCW) ControlPosition {
@@ -529,6 +556,31 @@ func (ss *CommonState) IsATPAVolume25nmEnabled(volumeId string) bool {
 	return false
 }
 
+// assignedSpeedForSTT extracts a representative controller-assigned speed
+// from a nav speed restriction for the STT aircraft context. It returns the
+// value in whichever units the restriction uses: knots, or mach in
+// hundredths (78 for M0.78, matching the STT "M" command). At most one
+// return is non-zero; a nil restriction yields (0, 0).
+func assignedSpeedForSTT(sr *av.SpeedRestriction) (knots, mach int) {
+	if sr == nil {
+		return 0, 0
+	}
+	val, exact := sr.ExactValue()
+	if !exact {
+		// Range restriction (at-or-above / at-or-below / band): take the
+		// constraining, non-extreme bound.
+		if sr.Range[0] > 0 {
+			val = sr.Range[0]
+		} else {
+			val = sr.Range[1]
+		}
+	}
+	if sr.IsMach {
+		return 0, int(val*100 + 0.5)
+	}
+	return int(val), 0
+}
+
 type Track struct {
 	av.RadarTrack
 
@@ -550,8 +602,10 @@ type Track struct {
 	Approach                  string   // Full name of assigned approach, if any
 	Fixes                     []string // Relevant fix names for STT
 	RouteFixes                []string // Ordered route waypoint fix names (no truncation)
-	AssignedApproachFixes     []string // Fix names from the assigned/expected approach (all)
 	ExpectedDirectFix         string   // Fix the controller said to "expect direct", if any
+	AssignedHeading           int      // Controller-assigned heading from nav (0 if none), for STT
+	AssignedSpeed             int      // Controller-assigned speed in knots from nav (0 if none / if mach), for STT
+	AssignedMach              int      // Controller-assigned mach in hundredths from nav (0 if none / if knots), for STT
 	SID                       string
 	STAR                      string
 	ATPAVolume                *av.ATPAVolume

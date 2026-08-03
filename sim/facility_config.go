@@ -8,23 +8,22 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
 	av "github.com/mmp/vice/aviation"
+	"github.com/mmp/vice/enroute"
 	"github.com/mmp/vice/math"
 	"github.com/mmp/vice/util"
 )
 
 // FacilityConfig represents an external facility configuration file that
-// contains control positions, STARS configuration, handoff IDs, and
-// fix pair definitions for a facility (TRACON or ARTCC).
+// contains control positions, STARS configuration, and handoff IDs for a
+// facility (TRACON or ARTCC).
 type FacilityConfig struct {
 	ControlPositions           map[TCP]*av.Controller `json:"control_positions"`
 	FacilityAdaptation         FacilityAdaptation     `json:"facility_adaptations"`
 	HandoffIDs                 []HandoffID            `json:"handoff_ids"`
-	FixPairs                   []FixPairDefinition    `json:"fix_pairs"`
 	DisableTFRRestrictionAreas bool                   `json:"disable_tfr_restriction_areas"`
 }
 
@@ -41,25 +40,6 @@ type HandoffID struct {
 	StarsID           string `json:"stars_id,omitempty"`
 	FieldEFormat      string `json:"field_e_format,omitempty"`
 	FieldELetter      string `json:"field_e_letter,omitempty"`
-}
-
-// FixPairDefinition defines a fixed pair (entry fix, exit fix) with
-// optional constraints. Fix pairs are used in TRACON facility configs
-// to provide fine-grained routing rules for aircraft assignment.
-type FixPairDefinition struct {
-	EntryFix      string `json:"entry_fix"`                // Entry fix name, empty = wildcard
-	ExitFix       string `json:"exit_fix"`                 // Exit fix name, empty = wildcard
-	FlightType    string `json:"flight_type,omitempty"`    // "A" (arrival), "P" (departure), "E" (overflight), empty = any
-	AltitudeRange [2]int `json:"altitude_range,omitempty"` // [floor, ceiling] in feet; [0,0] = no constraint
-	Priority      int    `json:"priority"`                 // Lower number = higher priority; must be unique per config
-}
-
-// FixPairAssignment maps a fix pair definition (by index) to a controller
-// TCP for a specific configuration. These are stored in
-// FacilityConfiguration alongside inbound/departure assignments.
-type FixPairAssignment struct {
-	TCP      TCP `json:"tcp"`      // Controller assigned to handle this fix pair
-	Priority int `json:"priority"` // Priority for deterministic matching
 }
 
 // PostDeserialize validates the facility config right after JSON
@@ -239,11 +219,6 @@ func (fc *FacilityConfig) PostDeserialize(configPath string, e *util.ErrorLogger
 		e.Pop()
 	}
 
-	// Fix pair validation (TODO)
-	// - priority uniqueness
-	// - flight_type in {"A", "P", "E", ""}
-	// - altitude_range floor <= ceiling
-
 	fc.validateAdaptation(isARTCC, e)
 }
 
@@ -274,56 +249,9 @@ func (fc *FacilityConfig) validateAdaptation(isARTCC bool, e *util.ErrorLogger) 
 			}
 		}
 
-		for parent, children := range config.DefaultConsolidation {
-			if _, ok := fc.ControlPositions[parent]; !ok {
-				e.ErrorString(`default_consolidation: parent %q is not in "control_positions"`, parent)
-			}
-			for _, child := range children {
-				if _, ok := fc.ControlPositions[child]; !ok {
-					e.ErrorString(`default_consolidation: child %q (under %q) is not in "control_positions"`, child, parent)
-				}
-			}
-		}
-
-		// Check for exactly one root position.
-		if _, err := config.DefaultConsolidation.RootPosition(); err != nil {
-			e.Error(err)
-		}
-
-		// Check for cycles (a position can't be its own ancestor).
-		getConsolidatedInto := func(tcp TCP) TCP {
-			for parent, children := range config.DefaultConsolidation {
-				if slices.Contains(children, tcp) {
-					return parent
-				}
-			}
-			return ""
-		}
-		for tcp := range config.DefaultConsolidation {
-			visited := make(map[TCP]bool)
-			current := tcp
-			for current != "" {
-				if visited[current] {
-					e.ErrorString("cycle detected in consolidation hierarchy involving %q", tcp)
-					break
-				}
-				visited[current] = true
-				current = getConsolidatedInto(current)
-			}
-		}
-
-		// Check that no position appears as a child of multiple parents.
-		childParent := make(map[TCP]TCP)
-		for parent, children := range config.DefaultConsolidation {
-			for _, child := range children {
-				if existingParent, ok := childParent[child]; ok {
-					e.ErrorString(`position %q appears as a child of both %q and %q in "default_consolidation"`,
-						child, existingParent, parent)
-				} else {
-					childParent[child] = parent
-				}
-			}
-		}
+		// Validate the consolidation tree (positions, single root, cycles,
+		// multi-parent). Shared with scenario-level consolidation.
+		config.DefaultConsolidation.Validate(fc.ControlPositions, e)
 
 		// Resolve scratchpad leader line direction strings to native directions.
 		if len(config.ScratchpadLeaderLineDirectionStrings) > 0 {
@@ -378,6 +306,14 @@ func (fc *FacilityConfig) validateAdaptation(isARTCC bool, e *util.ErrorLogger) 
 
 func (fc *FacilityConfig) validateSTARSAdaptation(e *util.ErrorLogger) {
 	fa := &fc.FacilityAdaptation
+
+	// Aircraft type classes, then the fix-pair configuration that references
+	// them.
+	validateAircraftClasses("tcp_assignment_classes", fa.TCPAssignmentClasses, e)
+	validateAircraftClasses("automatic_handoff_classes", fa.AutomaticHandoffClasses, e)
+	fa.FixPairConfiguration.validate(fa, fc.ControlPositions, e)
+	// Automatic scratchpad assignment: validate + sort.
+	validateAutoScratchpad(fa.AutoScratchpadAssignment, e)
 
 	// Collect all video map names across all area configs.
 	var allAreaVideoMaps []string
@@ -508,10 +444,12 @@ func (fc *FacilityConfig) validateSTARSAdaptation(e *util.ErrorLogger) {
 		e.Pop()
 	}
 
-	// Coordination lists: name/id required, id uniqueness.
+	// Coordination lists: name/id required, id uniqueness, owner_tcp validity,
+	// and no overlapping (airport, owner) coverage.
 	seenIds := make(map[string][]string)
+	airportOwners := make(map[string][]TCP) // airport -> each covering list's owner_tcp ("" = catch-all)
 	for _, list := range fa.Lists.Coordination {
-		e.Push(`"coordination_lists" ` + list.Name)
+		e.Push(`"lists.coordination" ` + list.Name)
 
 		if list.Name == "" {
 			e.ErrorString(`"name" must be specified for coordination list.`)
@@ -522,14 +460,40 @@ func (fc *FacilityConfig) validateSTARSAdaptation(e *util.ErrorLogger) {
 		if len(list.Airports) == 0 {
 			e.ErrorString(`At least one airport must be specified in "airports" for coordination list.`)
 		}
+		if list.OwnerTCP != "" {
+			if _, ok := fc.ControlPositions[list.OwnerTCP]; !ok {
+				e.ErrorString(`"owner_tcp" %q is not in "control_positions"`, list.OwnerTCP)
+			}
+		}
 
 		seenIds[list.Id] = append(seenIds[list.Id], list.Name)
+		for _, ap := range list.Airports {
+			airportOwners[ap] = append(airportOwners[ap], list.OwnerTCP)
+		}
 
 		e.Pop()
 	}
 	for id, groups := range seenIds {
 		if len(groups) > 1 {
-			e.ErrorString(`Multiple "coordination_lists" are using id %q: %s`, id, strings.Join(groups, ", "))
+			e.ErrorString(`Multiple "lists.coordination" entries are using id %q: %s`, id, strings.Join(groups, ", "))
+		}
+	}
+
+	// Per airport, at most one list per distinct owner: several owner-scoped
+	// lists plus at most one catch-all (no owner_tcp) are allowed. A catch-all
+	// shows the "remainder" -- departures whose owner has no dedicated list --
+	// so a departure always lands in exactly one list.
+	for ap, owners := range airportOwners {
+		seen := make(map[TCP]bool)
+		for _, o := range owners {
+			if seen[o] {
+				if o == "" {
+					e.ErrorString(`airport %q has multiple catch-all "lists.coordination" entries (no "owner_tcp")`, ap)
+				} else {
+					e.ErrorString(`airport %q has multiple "lists.coordination" entries for "owner_tcp" %q`, ap, o)
+				}
+			}
+			seen[o] = true
 		}
 	}
 
@@ -584,16 +548,6 @@ func (fc *FacilityConfig) validateSTARSAdaptation(e *util.ErrorLogger) {
 			}
 		}
 
-		// Auto-generate flight following airspace IDs/descriptions.
-		for i := range ac.FlightFollowingAirspace {
-			if ac.FlightFollowingAirspace[i].Id == "" {
-				ac.FlightFollowingAirspace[i].Id = fmt.Sprintf("FFA%s-%d", areaNum, i+1)
-			}
-			if ac.FlightFollowingAirspace[i].Description == "" {
-				ac.FlightFollowingAirspace[i].Description = fmt.Sprintf("FLIGHT FOLLOWING AREA %s %d", areaNum, i+1)
-			}
-		}
-
 		// Parse area beacon code blocks.
 		if ac.MonitoredBeaconCodeBlocksString != nil {
 			for s := range strings.SplitSeq(*ac.MonitoredBeaconCodeBlocksString, ",") {
@@ -639,8 +593,8 @@ func (fc *FacilityConfig) validateSTARSAdaptation(e *util.ErrorLogger) {
 		}
 	}
 
-	// Validate TCP references in Quicklook and FDAM filter regions
-	// against this facility's ControlPositions.
+	// Validate TCP references in Quicklook, FDAM, and auto-handoff filter
+	// regions against this facility's ControlPositions.
 	for i, filt := range fa.Filters.Quicklook {
 		e.Push(filt.Description)
 		fa.Filters.Quicklook[i].ValidateTCPs(fc.ControlPositions, e)
@@ -649,6 +603,16 @@ func (fc *FacilityConfig) validateSTARSAdaptation(e *util.ErrorLogger) {
 	for i, filt := range fa.Filters.FDAM {
 		e.Push(filt.Description)
 		fa.Filters.FDAM[i].ValidateTCPs(fc.ControlPositions, e)
+		e.Pop()
+	}
+	for i, filt := range fa.Filters.Handoff {
+		e.Push(filt.Description)
+		fa.Filters.Handoff[i].ValidateTCPs(fc.ControlPositions, e)
+		if ac := fa.Filters.Handoff[i].ACTypeClass; ac != "" && ac != "*" {
+			if _, ok := fa.AutomaticHandoffClasses[ac]; !ok {
+				e.ErrorString(`"actype_class" %q is not a class in "automatic_handoff_classes"`, ac)
+			}
+		}
 		e.Pop()
 	}
 
@@ -717,6 +681,16 @@ func (fc *FacilityConfig) validateSTARSAdaptation(e *util.ErrorLogger) {
 func (fc *FacilityConfig) validateERAMAdaptation(e *util.ErrorLogger) {
 	fa := &fc.FacilityAdaptation
 
+	// Pseudo-ERAM coordination adaptation.
+	enroute.Validate(fa.ArtsCoordination, fa.Restrictions, e)
+
+	// ERAM facilities may also adapt fix pairs: an ARTCC-primary scenario
+	// self-hosts its coordination (keyed by the ARTCC's own id) and assigns
+	// owners for its inbound flows from the same fix-pair tables STARS uses.
+	validateAircraftClasses("tcp_assignment_classes", fa.TCPAssignmentClasses, e)
+	fa.FixPairConfiguration.validate(fa, fc.ControlPositions, e)
+	validateAutoScratchpad(fa.AutoScratchpadAssignment, e)
+
 	// Validate area configs if present.
 	if len(fa.Areas) > 0 {
 		usedAreas := make(map[string]bool)
@@ -731,63 +705,4 @@ func (fc *FacilityConfig) validateERAMAdaptation(e *util.ErrorLogger) {
 			}
 		}
 	}
-}
-
-// MatchFixPair finds the highest-priority fix pair that matches the given
-// aircraft parameters. Returns the index into the FixPairs slice and true
-// if a match is found, or -1 and false otherwise.
-func MatchFixPair(fixPairs []FixPairDefinition, entryFix, exitFix string, flightType av.TypeOfFlight, altitude int) (int, bool) {
-	// Sort by priority (lower = higher priority)
-	type indexedPair struct {
-		index int
-		pair  FixPairDefinition
-	}
-	sorted := make([]indexedPair, len(fixPairs))
-	for i, fp := range fixPairs {
-		sorted[i] = indexedPair{index: i, pair: fp}
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].pair.Priority < sorted[j].pair.Priority
-	})
-
-	for _, ip := range sorted {
-		fp := ip.pair
-
-		// Entry fix match (empty = wildcard)
-		if fp.EntryFix != "" && fp.EntryFix != entryFix {
-			continue
-		}
-
-		// Exit fix match (empty = wildcard)
-		if fp.ExitFix != "" && fp.ExitFix != exitFix {
-			continue
-		}
-
-		// Flight type match (empty = any)
-		if fp.FlightType != "" {
-			var ftStr string
-			switch flightType {
-			case av.FlightTypeArrival:
-				ftStr = "A"
-			case av.FlightTypeDeparture:
-				ftStr = "P"
-			case av.FlightTypeOverflight:
-				ftStr = "E"
-			}
-			if fp.FlightType != ftStr {
-				continue
-			}
-		}
-
-		// Altitude range match ([0,0] = no constraint)
-		if fp.AltitudeRange[0] != 0 || fp.AltitudeRange[1] != 0 {
-			if altitude < fp.AltitudeRange[0] || altitude > fp.AltitudeRange[1] {
-				continue
-			}
-		}
-
-		return ip.index, true
-	}
-
-	return -1, false
 }

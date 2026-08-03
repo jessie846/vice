@@ -58,10 +58,18 @@ func ParseInterimAltType(ch byte) (t InterimAltType, ok bool) {
 // NASFlightPlan
 
 type NASFlightPlan struct {
-	ACID                  ACID
-	CID                   string
-	EntryFix              string
-	ExitFix               string
+	ACID     ACID
+	CID      string
+	EntryFix string
+	ExitFix  string
+	// DerivedEntryFix/DerivedExitFix are set when fix-pair reassignment
+	// substitutes a derived fix for that end of the pair; empty means no
+	// substitution. The flight plan keeps its actual fixes: the derived pair
+	// is used for owning-TCP assignment, automatic scratchpad assignment, and
+	// handoff-filter qualification, and the FDB prefers the derived fix's
+	// abbreviation, but the displayed entry/exit fixes remain the actual ones.
+	DerivedEntryFix       string
+	DerivedExitFix        string
 	ArrivalAirport        string // Technically not a string, but until the NAS system is fully integrated, we'll need this.
 	ExitFixIsIntermediate bool
 	Rules                 av.FlightRules
@@ -128,6 +136,23 @@ type NASFlightPlan struct {
 	ContainedFacilities []string
 	RedirectedHandoff   RedirectedHandoff
 
+	// LocalArrival marks an internal ("fully-contained") flight whose exit fix
+	// is a local-arrival airport, i.e. its destination is within this facility.
+	LocalArrival bool `json:"-"`
+
+	// AutoHandoffInhibited marks the track ineligible for automatic handoff
+	// processing (AHOP); it drives the delta indicator in the data block.
+	AutoHandoffInhibited bool
+	// AutoHandoffInhibitLocked is set when AHOP was disabled by a handoff
+	// filter row with the "D" action, which a controller can't reverse
+	// (STARS 5.1.7, p. 5-15).
+	AutoHandoffInhibitLocked bool
+	// HandoffWasAutomatic is set while a handoff initiated by auto-handoff
+	// filter processing is pending and cleared when it is accepted; recalling
+	// such a handoff makes the track ineligible for further automatic
+	// handoffs (STARS 5.1.17, p. 5-33).
+	HandoffWasAutomatic bool
+
 	InhibitACTypeDisplay      bool
 	ForceACTypeDisplayEndTime Time
 	CWTCategory               string
@@ -141,6 +166,10 @@ type NASFlightPlan struct {
 
 	// FDAM region membership state, keyed by region ID.
 	FDAMState map[string]*FDAMTrackState `json:"-"`
+
+	// Auto-handoff filter membership state, keyed by region ID. The value is
+	// whether the track currently satisfies the region (inside + conditions).
+	HandoffFilterState map[string]bool `json:"-"`
 
 	// Flight strip fields
 	StripCID         int             // numeric 000-999, allocated server-side
@@ -205,9 +234,17 @@ func (fp *NASFlightPlan) Update(spec FlightPlanSpecifier, sim *Sim) (err error) 
 		fp.PlanType = spec.PlanType.Get()
 	}
 	if spec.EntryFix.IsSet {
+		if fp.EntryFix != spec.EntryFix.Get() {
+			// The derived fix was substituted for the old entry fix; it no
+			// longer applies once the actual fix changes.
+			fp.DerivedEntryFix = ""
+		}
 		fp.EntryFix = spec.EntryFix.Get()
 	}
 	if spec.ExitFix.IsSet {
+		if fp.ExitFix != spec.ExitFix.Get() {
+			fp.DerivedExitFix = ""
+		}
 		fp.ExitFix = spec.ExitFix.Get()
 		fp.ExitFixIsIntermediate = spec.ExitFixIsIntermediate.GetOr(false)
 
@@ -347,6 +384,9 @@ func (fp *NASFlightPlan) Update(spec FlightPlanSpecifier, sim *Sim) (err error) 
 	if spec.InhibitACTypeDisplay.IsSet {
 		fp.InhibitACTypeDisplay = spec.InhibitACTypeDisplay.Get()
 	}
+	if spec.AutoHandoffInhibited.IsSet {
+		fp.AutoHandoffInhibited = spec.AutoHandoffInhibited.Get()
+	}
 	if spec.ForceACTypeDisplayEndTime.IsSet {
 		fp.ForceACTypeDisplayEndTime = spec.ForceACTypeDisplayEndTime.Get()
 	}
@@ -406,6 +446,7 @@ type FlightPlanSpecifier struct {
 	CoastSuspendIndex           util.Optional[int]
 
 	InhibitACTypeDisplay      util.Optional[bool]
+	AutoHandoffInhibited      util.Optional[bool]
 	ForceACTypeDisplayEndTime util.Optional[Time]
 }
 
@@ -670,7 +711,7 @@ func (s *Sim) ModifyFlightPlan(tcw TCW, acid ACID, spec FlightPlanSpecifier) err
 
 	s.lastControlCommandTime = time.Now()
 
-	fp, _, active := s.getFlightPlanForACID(acid)
+	fp, ac, active := s.getFlightPlanForACID(acid)
 	if fp == nil {
 		return ErrNoMatchingFlightPlan
 	}
@@ -686,6 +727,12 @@ func (s *Sim) ModifyFlightPlan(tcw TCW, acid ACID, spec FlightPlanSpecifier) err
 
 	if !s.TCWCanModifyFlightPlan(tcw, fp) {
 		return av.ErrOtherControllerHasTrack
+	}
+
+	if spec.AutoHandoffInhibited.IsSet {
+		if err := s.checkAutoHandoffToggle(fp, ac); err != nil {
+			return err
+		}
 	}
 
 	if active {

@@ -11,12 +11,13 @@ import (
 	"time"
 
 	av "github.com/mmp/vice/aviation"
+	"github.com/mmp/vice/enroute"
 	"github.com/mmp/vice/math"
 	"github.com/mmp/vice/util"
 )
 
-// FacilityConfiguration defines which controller handles each inbound/departure flow,
-// the default consolidation hierarchy for the configuration, and optional fix pair assignments.
+// FacilityConfiguration defines which controller handles each inbound/departure flow
+// and the default consolidation hierarchy for the configuration.
 type FacilityConfiguration struct {
 	InboundAssignments   map[string]TCP `json:"inbound_assignments"`
 	DepartureAssignments map[string]TCP `json:"departure_assignments"`
@@ -24,7 +25,6 @@ type FacilityConfiguration struct {
 	// who should handle go-arounds. If not specified, departure controller is used.
 	GoAroundAssignments  map[string]TCP        `json:"go_around_assignments"`
 	DefaultConsolidation PositionConsolidation `json:"default_consolidation"`
-	FixPairAssignments   []FixPairAssignment   `json:"fix_pair_assignments,omitempty"`
 
 	// ScratchpadLeaderLineDirectionStrings is the JSON-facing map from
 	// primary scratchpad values to cardinal/ordinal direction strings
@@ -53,18 +53,41 @@ type FacilityAdaptation struct {
 	Scratchpads       map[string]string                    `json:"scratchpads"`
 	SignificantPoints map[string]SignificantPoint          `json:"significant_points"`
 
+	// Airports are fix-pair endpoints that name an airport rather than a
+	// significant point.
+	Airports map[string]*FixPairAirport `json:"airports,omitempty"`
+	// FixPairConfiguration is the STARS-side fix-pair adaptation: reassignment
+	// rules and per-configuration-plan owner assignments.
+	FixPairConfiguration *FixPairConfiguration `json:"fix_pair_configuration,omitempty"`
+	// AutoScratchpadAssignment sets a flight's default scratchpad(s) at
+	// creation from adapted criteria (DMS Sec. 4.7.8, p. 4-189).
+	AutoScratchpadAssignment []AutoScratchpadRow `json:"automatic_scratchpad_assignment,omitempty"`
+	// TCPAssignmentClasses and AutomaticHandoffClasses name adapted aircraft
+	// classes (DMS Sec. 4.21.1), each mapping a class name (1-8 alphanumeric
+	// characters, at most 26 classes) to the aircraft types in the class.
+	// The former is referenced by fix-pair reassignment rules' "ac_type", the
+	// latter by handoff filters' "actype_class".
+	TCPAssignmentClasses    map[string][]string `json:"tcp_assignment_classes,omitempty"`
+	AutomaticHandoffClasses map[string][]string `json:"automatic_handoff_classes,omitempty"`
+
+	// Pseudo-ERAM coordination adaptation; these live on the ARTCC (ERAM host)
+	// configuration rather than on a TRACON's.
+	ArtsCoordination map[string]*enroute.ArtsCoordEntry `json:"arts_coordination,omitempty"`
+	Restrictions     []enroute.Restriction              `json:"restrictions,omitempty"`
+
 	// Airpsace filters
 	Filters struct {
-		AutoAcquisition FilterRegions    `json:"auto_acquisition"`
-		ArrivalDrop     FilterRegions    `json:"arrival_drop"`
-		Departure       FilterRegions    `json:"departure"`
-		InhibitCA       FilterRegions    `json:"inhibit_ca"`
-		InhibitMSAW     FilterRegions    `json:"inhibit_msaw"`
-		Quicklook       QuicklookRegions `json:"quicklook"`
-		FDAM            FDAMRegions      `json:"fdam"`
-		SecondaryDrop   FilterRegions    `json:"secondary_drop"`
-		SurfaceTracking FilterRegions    `json:"surface_tracking"`
-		VFRInhibit      FilterRegions    `json:"vfr_inhibit"`
+		AutoAcquisition FilterRegions        `json:"auto_acquisition"`
+		ArrivalDrop     FilterRegions        `json:"arrival_drop"`
+		Departure       FilterRegions        `json:"departure"`
+		InhibitCA       FilterRegions        `json:"inhibit_ca"`
+		InhibitMSAW     FilterRegions        `json:"inhibit_msaw"`
+		Quicklook       QuicklookRegions     `json:"quicklook"`
+		FDAM            FDAMRegions          `json:"fdam"`
+		Handoff         HandoffFilterRegions `json:"handoff"`
+		SecondaryDrop   FilterRegions        `json:"secondary_drop"`
+		SurfaceTracking FilterRegions        `json:"surface_tracking"`
+		VFRInhibit      FilterRegions        `json:"vfr_inhibit"`
 	} `json:"filters"`
 
 	MonitoredBeaconCodeBlocksString  *string
@@ -215,21 +238,18 @@ type STARSController struct {
 // within a TRACON area. Controller-specific settings in Controllers
 // override or append these defaults.
 type STARSArea struct {
-	DefaultAirport                  string                         `json:"default_airport,omitempty"` // CRDA default airport for this area
-	VideoMapFile                    string                         `json:"video_map_file,omitempty"`
-	VideoMapNames                   []string                       `json:"video_maps,omitempty"`
-	DefaultMaps                     []string                       `json:"default_maps,omitempty"`
-	Center                          math.Point2LL                  `json:"-"`
-	CenterString                    string                         `json:"center,omitempty"`
-	Range                           float32                        `json:"range,omitempty"`
-	MonitoredBeaconCodeBlocksString *string                        `json:"beacon_code_blocks,omitempty"`
-	MonitoredBeaconCodeBlocks       []av.Squawk                    `json:"-"`
-	FlightFollowingAirspace         []av.AirspaceVolume            `json:"flight_following_airspace,omitempty"`
-	Altimeters                      []string                       `json:"altimeters,omitempty"`
-	Scratchpads                     map[string]string              `json:"scratchpads,omitempty"`
-	CoordinationLists               []CoordinationList             `json:"coordination_lists,omitempty"`
-	AirspaceAwareness               []AirspaceAwareness            `json:"airspace_awareness,omitempty"`
-	Airspace                        map[string][]av.AirspaceVolume `json:"airspace,omitempty"`
+	DefaultAirport                  string              `json:"default_airport,omitempty"` // CRDA default airport for this area
+	VideoMapFile                    string              `json:"video_map_file,omitempty"`
+	VideoMapNames                   []string            `json:"video_maps,omitempty"`
+	DefaultMaps                     []string            `json:"default_maps,omitempty"`
+	Center                          math.Point2LL       `json:"-"`
+	CenterString                    string              `json:"center,omitempty"`
+	Range                           float32             `json:"range,omitempty"`
+	MonitoredBeaconCodeBlocksString *string             `json:"beacon_code_blocks,omitempty"`
+	MonitoredBeaconCodeBlocks       []av.Squawk         `json:"-"`
+	Altimeters                      []string            `json:"altimeters,omitempty"`
+	Scratchpads                     map[string]string   `json:"scratchpads,omitempty"`
+	AirspaceAwareness               []AirspaceAwareness `json:"airspace_awareness,omitempty"`
 }
 
 // CurrentDatablockClockPhase returns the current clock phase (1-4)
@@ -355,6 +375,14 @@ type CoordinationList struct {
 	Airports      []string `json:"airports"`
 	YellowEntries bool     `json:"yellow_entries"`
 	Format        string   `json:"format"`
+
+	// OwnerTCP, if set, restricts this list to release requests for departures
+	// assigned to that departure controller TCP. This does not assign the
+	// departure controller; it only lets one airport's releases be split across
+	// several lists by assigned TCP.
+	// Empty = all assigned TCPs for the list's airports, or the remainder when
+	// the airport also has owner-scoped lists.
+	OwnerTCP TCP `json:"owner_tcp,omitempty"`
 }
 
 // Validates a format string for a STARS system list. Extra specifiers that are specific to
@@ -414,6 +442,30 @@ func (fa *FacilityAdaptation) PostDeserialize(loc av.Locator, e *util.ErrorLogge
 		fa.Center = pos
 	}
 
+	// Resolve fix-pair airport locations and check their abbreviations (the
+	// same single-character rule as significant points). The name and
+	// location default from the airport database, so most entries are empty.
+	for id, ap := range fa.Airports {
+		if abbrev := ap.Abbreviation; len(abbrev) > 1 {
+			e.ErrorString("airports[%s]: abbreviation %q must be a single character", id, abbrev)
+		}
+		faa, inDB := av.DB.LookupAirport(id)
+		if ap.Name == "" && inDB {
+			ap.Name = faa.Name
+		}
+		if ap.LocationStr == "" {
+			if inDB {
+				ap.Location = faa.Location
+			} else {
+				e.ErrorString(`airports[%s]: no "location" given and airport not in database`, id)
+			}
+		} else if pos, ok := loc.Locate(ap.LocationStr); ok {
+			ap.Location = pos
+		} else {
+			e.ErrorString("airports[%s]: unknown location %q", id, ap.LocationStr)
+		}
+	}
+
 	// Locator-dependent controller config validation.
 	for tcp, config := range fa.Controllers {
 		e.Push(fmt.Sprintf("controllers[%s]", tcp))
@@ -437,26 +489,12 @@ func (fa *FacilityAdaptation) PostDeserialize(loc av.Locator, e *util.ErrorLogge
 	for areaNum, ac := range fa.Areas {
 		e.Push(fmt.Sprintf("areas[%s]", areaNum))
 
-		for i := range ac.FlightFollowingAirspace {
-			ac.FlightFollowingAirspace[i].PostDeserialize(loc, e)
-		}
-
 		if ac.CenterString != "" {
 			if pos, ok := loc.Locate(ac.CenterString); ok {
 				ac.Center = pos
 			} else {
 				e.ErrorString("unknown location %q specified for area center", ac.CenterString)
 			}
-		}
-
-		for name, volumes := range ac.Airspace {
-			for i := range volumes {
-				volumes[i].PostDeserialize(loc, e)
-				if volumes[i].Id == "" {
-					volumes[i].Id = fmt.Sprintf("A%s-%s-%d", areaNum, name, i+1)
-				}
-			}
-			ac.Airspace[name] = volumes
 		}
 
 		e.Pop()
@@ -507,6 +545,21 @@ func (fa *FacilityAdaptation) PostDeserialize(loc av.Locator, e *util.ErrorLogge
 
 			if _, ok := ids[filt.Id]; ok {
 				e.ErrorString(`FDAM filter "id"s must be unique: %q was repeated`, filt.Id)
+			}
+			ids[filt.Id] = nil
+
+			e.Pop()
+		}
+	}
+
+	{
+		ids := make(map[string]any)
+		for i, filt := range fa.Filters.Handoff {
+			e.Push(filt.Description)
+			fa.Filters.Handoff[i].PostDeserialize(loc, e)
+
+			if _, ok := ids[filt.Id]; ok {
+				e.ErrorString(`handoff filter "id"s must be unique: %q was repeated`, filt.Id)
 			}
 			ids[filt.Id] = nil
 

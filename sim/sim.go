@@ -15,6 +15,7 @@ import (
 	"time"
 
 	av "github.com/mmp/vice/aviation"
+	"github.com/mmp/vice/enroute"
 	"github.com/mmp/vice/log"
 	"github.com/mmp/vice/math"
 	"github.com/mmp/vice/nav"
@@ -66,7 +67,10 @@ type Sim struct {
 	PatternState map[string]*PatternState
 	// Key is inbound flow group name
 	NextInboundSpawn map[string]Time
-	NextVFFRequest   Time
+	// Key is inbound flow group name; overflights spawn on their own timer
+	// since they are always rate-based, regardless of the traffic source.
+	NextOverflightSpawn map[string]Time
+	NextVFFRequest      Time
 
 	Handoffs  map[ACID]Handoff
 	PointOuts map[ACID][]PointOut
@@ -109,6 +113,17 @@ type Sim struct {
 	PushEnd       Time
 
 	Rand *rand.Rand
+
+	// User-selected scenario start time before Vice rewinds the clock for prespawn.
+	StartTime Time
+
+	// historicalFlights are the flights a scenario using historical traffic was
+	// launched with, in time order.
+	historicalFlights []av.Flight
+
+	// Runtime-only source for automatically generated IFR traffic. This is
+	// intentionally unexported so it is not part of saved simulation state.
+	trafficProvider trafficProvider
 
 	VoiceAssigner *VoiceAssigner
 
@@ -192,18 +207,20 @@ type NewSimConfiguration struct {
 
 	Emergencies []Emergency
 
-	HandoffIDs         []HandoffID
-	FixPairs           []FixPairDefinition
-	FixPairAssignments []FixPairAssignment
+	HandoffIDs []HandoffID
+	// ERAMCoordination is the resolved pseudo-ERAM adaptation for this
+	// facility's TRACON computer id, or nil if none is adapted.
+	ERAMCoordination *enroute.Coordination
 }
 
 func NewSim(config NewSimConfiguration, lg *log.Logger) *Sim {
 	s := &Sim{
 		Aircraft: make(map[av.ADSBCallsign]*Aircraft),
 
-		DepartureState:   make(map[string]map[av.RunwayID]*RunwayLaunchState),
-		PatternState:     make(map[string]*PatternState),
-		NextInboundSpawn: make(map[string]Time),
+		DepartureState:      make(map[string]map[av.RunwayID]*RunwayLaunchState),
+		PatternState:        make(map[string]*PatternState),
+		NextInboundSpawn:    make(map[string]Time),
+		NextOverflightSpawn: make(map[string]Time),
 
 		ControlPositions:     config.ControlPositions,
 		InboundAssignments:   config.ControllerConfiguration.InboundAssignments,
@@ -248,6 +265,8 @@ func NewSim(config NewSimConfiguration, lg *log.Logger) *Sim {
 		VirtualControllers: config.VirtualControllers,
 
 		Rand: rand.Make(),
+
+		StartTime: NewSimTime(config.StartTime.UTC()),
 
 		SquawkWarnedACIDs: make(map[ACID]any),
 
@@ -434,6 +453,10 @@ func (s *Sim) Activate(lg *log.Logger, provider *wx.Provider) {
 		s.Rand = rand.Make()
 	}
 
+	if s.NextOverflightSpawn == nil {
+		s.NextOverflightSpawn = make(map[string]Time)
+	}
+
 	s.wxProvider = provider
 	if s.wxModel == nil {
 		s.wxModel = wx.MakeModel(provider, s.State.Facility, s.State.PrimaryAirport, s.State.SimTime.Time(), s.lg)
@@ -442,6 +465,25 @@ func (s *Sim) Activate(lg *log.Logger, provider *wx.Provider) {
 	// Restore json:"-" fields that are lost during JSON config save/load.
 	restoreControllerFields(s.ControlPositions)
 	restoreControllerFields(s.State.Controllers)
+	restoreERAMCoordinationGeometry(s.State.ERAMCoordination, lg)
+
+	// The historical flights are derived from the facility's flight data, so
+	// they are read here rather than saved with the sim.
+	s.loadHistoricalFlights()
+}
+
+// restoreERAMCoordinationGeometry re-derives the json:"-" geometry (zone-area
+// centers, restriction lines) that ParseGeometry parses from adapted strings
+// at scenario-group load: a saved sim's restore goes through Activate, not
+// scenario loading, so without this the geometry would be zero-valued and
+// zone_based coordination would compute bearings from the origin.
+func restoreERAMCoordinationGeometry(ec *enroute.Coordination, lg *log.Logger) {
+	if ec == nil || ec.Coord == nil {
+		return
+	}
+	var errs util.ErrorLogger
+	enroute.ParseGeometry(map[string]*enroute.ArtsCoordEntry{ec.ComputerID: ec.Coord}, ec.Restrictions, enroute.DBLocator{}, &errs)
+	errs.PrintErrors(lg)
 }
 
 // restoreControllerFields reconstructs the json:"-" fields
@@ -523,6 +565,7 @@ func (s *Sim) LogValue() slog.Value {
 		slog.Any("state", s.State),
 		slog.Any("departure_state", s.DepartureState),
 		slog.Any("next_inbound_spawn", s.NextInboundSpawn),
+		slog.Any("next_overflight_spawn", s.NextOverflightSpawn),
 		slog.Any("automatic_handoffs", s.Handoffs),
 		slog.Any("automatic_pointouts", s.PointOuts),
 		slog.Time("next_push_start", s.NextPushStart.Time()),
@@ -749,8 +792,7 @@ func (s *Sim) isVirtualController(pos ControlPosition) bool {
 	if _, ok := s.ControlPositions[TCP(pos)]; !ok {
 		return false
 	}
-	humanPositions := s.ScenarioDefaultConsolidation.AllPositions()
-	return !slices.Contains(humanPositions, TCP(pos))
+	return !s.ScenarioDefaultConsolidation.IsHumanPosition(pos)
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -829,7 +871,9 @@ func (s *Sim) applyWaypointActionEvent(ac *Aircraft, actions av.WaypointActions)
 		if sfp == nil {
 			sfp = s.STARSComputer.lookupFlightPlanByACID(ACID(ac.ADSBCallsign))
 		}
-		if sfp != nil {
+		// Only initiate the handoff if a virtual controller has the track; if
+		// a human owns it, it's their call when to hand it off.
+		if sfp != nil && s.isVirtualController(sfp.TrackingController) {
 			s.handoffTrack(sfp, TCP(actions.HandoffController))
 		}
 	}
@@ -1010,6 +1054,7 @@ func (s *Sim) updateState() {
 				}
 				fp.OwningTCW = s.tcwForPosition(fp.TrackingController)
 				fp.HandoffController = ""
+				fp.HandoffWasAutomatic = false
 
 				if ac != nil {
 					haveTransferComms := slices.ContainsFunc(ac.Nav.Waypoints,
@@ -2058,8 +2103,10 @@ func (s *Sim) processFutureOnCourse() {
 				if ac, ok := s.Aircraft[oc.ADSBCallsign]; ok {
 					s.lg.Info("departing on course", slog.String("adsb_callsign", string(ac.ADSBCallsign)),
 						slog.Int("final_altitude", ac.FlightPlan.Altitude))
-					// Clear temporary altitude
-					if ac.NASFlightPlan != nil {
+					// Clear temporary altitude, unless the route's altitude
+					// actions govern the aircraft's altitude and it isn't
+					// climbing to cruise.
+					if ac.NASFlightPlan != nil && !ac.Nav.RouteAltitudeActions {
 						ac.NASFlightPlan.InterimAlt = 0
 						ac.NASFlightPlan.InterimType = InterimNormal
 					}

@@ -470,6 +470,20 @@ func (wp Waypoint) DescendAltitude() int {
 	return 0
 }
 
+// HasAltitudeActions reports whether the waypoint has a /c or /d altitude
+// action, either directly or in one of its action groups.
+func (wp Waypoint) HasAltitudeActions() bool {
+	if wp.ClimbAltitude() != 0 || wp.DescendAltitude() != 0 {
+		return true
+	}
+	for _, group := range wp.ActionGroups() {
+		if group.Actions.ClimbAltitude != 0 || group.Actions.DescendAltitude != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (wp Waypoint) WaypointActions() WaypointActions {
 	actions := WaypointActions{
 		HumanHandoff:              wp.HumanHandoff(),
@@ -614,6 +628,26 @@ func (wa WaypointArray) HasHumanHandoff() bool {
 		return wp.HumanHandoff() || slices.ContainsFunc(wp.ActionGroups(),
 			func(group WaypointActionGroup) bool { return group.Actions.HumanHandoff })
 	})
+}
+
+// HandoffControllers returns the positions the route names as handoff targets,
+// whether at a waypoint itself or in one of its conditional action groups.
+// These are the /hoXX handoffs, which name where the track goes; the bare /ho
+// of HasHumanHandoff leaves that to whoever is working the flow.
+func (wa WaypointArray) HandoffControllers() []ControlPosition {
+	var controllers []ControlPosition
+	add := func(pos ControlPosition) {
+		if pos != "" && !slices.Contains(controllers, pos) {
+			controllers = append(controllers, pos)
+		}
+	}
+	for _, wp := range wa {
+		add(wp.HandoffController())
+		for _, group := range wp.ActionGroups() {
+			add(group.Actions.HandoffController)
+		}
+	}
+	return controllers
 }
 
 func (wa WaypointArray) Encode() string {
@@ -885,16 +919,6 @@ func (wa WaypointArray) checkBasics(e *util.ErrorLogger, controllers map[Control
 			}
 			if !checkScratchpad(group.Actions.SecondaryScratchpad) {
 				e.ErrorString("%s: invalid secondary scratchpad", group.Actions.SecondaryScratchpad)
-			}
-		}
-
-		if wp.HumanHandoff() {
-			// Check if any subsequent waypoints have a HandoffController
-			for _, wfut := range wa[i:] {
-				if wfut.HandoffController() != "" {
-					e.ErrorString("Cannot have handoff to virtual controller after human handoff")
-					break
-				}
 			}
 		}
 

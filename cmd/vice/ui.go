@@ -315,8 +315,14 @@ func uiDraw(mgr *client.ConnectionManager, config *Config, p platform.Platform, 
 		if imgui.IsItemHovered() {
 			imgui.SetTooltip("Display information about vice")
 		}
-		if imgui.Button(renderer.FontAwesomeIconDiscord) {
-			browser.OpenURL("https://discord.gg/y993vgQxhY")
+		if imgui.BeginMenu(renderer.FontAwesomeIconDiscord) {
+			if imgui.MenuItemBool("vice development server") {
+				browser.OpenURL("https://discord.gg/y993vgQxhY")
+			}
+			if imgui.MenuItemBool("vice ATC Hub (staff-ups)") {
+				browser.OpenURL("https://discord.gg/hUqetK9xwt")
+			}
+			imgui.EndMenu()
 		}
 
 		if imgui.Button(util.Select(p.IsFullScreen(), renderer.FontAwesomeIconCompressAlt, renderer.FontAwesomeIconExpandAlt)) {
@@ -435,10 +441,10 @@ func showAboutDialog() {
 
 	ui.aboutFontSmall.ImguiPush()
 	credits := `Additional credits:
-- Software Development: Xavier Caldwell, Artem Dorofeev, Adam E, Dennis Graiani, Michael Knight, Ethan Malimon, Neel P, Makoto Sakaguchi, Michael Trokel, radarcontacto, Rick R, Samuel Valencia, Jordan Williams, and Yi Zhang.
+- Software Development: Xavier Caldwell, Artem Dorofeev, Adam E, Dennis Graiani, Michael Knight, Ethan Malimon, Neel P, Makoto Sakaguchi, Michael Trokel, radarcontacto, Shane, Rick R, Logan S, Samuel Valencia, Jordan Williams, and Yi Zhang.
 - Timely feedback: radarcontacto.
-- Facility engineering: Connor Allen, anguse, Elliot B, Adam Bolek, Brody Carty, Lucas Chan, CiceroIsBack, Aaron Flett, Mike Fries, Ryan G, Gecko, Ryan H, Thomas Halpin, Ethan Hawes, Jason Helkenberg, Trey Hensley, Elijah J, Austin Jenkins, Ketan K, Mike K, Allison L, Josh Lambert, Kayden Lambert, Mike LeGall, Jonah Lefkoff, Jud Lopez, Jake Magee, Ethan Malimon, manaphy, Jace Martin, Michael McConnell, Merry, Yahya Nazimuddin, Justin Nguyen, Giovanni, Andrew S, Logan S, Arya T, Nelson T, Tyler Temerowski, Eli Thompson, Michael Trokel, Samuel Valencia, Gavin Velicevic, and Jackson Verdoorn.
-- Video maps: thanks to the ZAU, ZBW, ZDC, ZDV, ZHU, ZID, ZJX, ZLA, ZMP, ZNY, ZOB, ZSE, and ZTL VATSIM ARTCCs and to the FAA, from whence the original maps came.
+- Facility engineering: AsianEvxn, Connor Allen, anguse, Elliot B, Adam Bolek, Brody Carty, Lucas Chan, CiceroIsBack, Aaron Flett, Mike Fries, Ryan G, Gecko, Ryan H, Thomas Halpin, Ethan Hawes, Jason Helkenberg, Trey Hensley, Noah Hunt, Elijah J, Austin Jenkins, Ketan K, Mike K, Allison L, Josh Lambert, Kayden Lambert, Mike LeGall, Jonah Lefkoff, Jud Lopez, Jake Magee, Ethan Malimon, manaphy, Jace Martin, Michael McConnell, Merry, Yahya Nazimuddin, Justin Nguyen, Giovanni, Shane, Andrew S, Logan S, Arya T, Nelson T, Tyler Temerowski, Eli Thompson, Michael Trokel, Samuel Valencia, Gavin Velicevic, and Jackson Verdoorn.
+- Video maps: thanks to all of the VATSIM ARTCCs and to the FAA, from whence the original maps came.
 - Additionally: OpenScope for the aircraft performance and airline databases, ourairports.com for the airport database, and for the FAA for being awesome about providing the CIFP, MVA specifications, and other useful aviation data digitally.
 - One more thing: see the file CREDITS.txt in the vice source code distribution for third-party software, fonts, sounds, etc.`
 

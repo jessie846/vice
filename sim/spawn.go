@@ -20,6 +20,11 @@ import (
 const initialSimSeconds = 30 * 60
 const initialSimControlledSeconds = 60
 
+// PrespawnDuration is how far the clock rewinds before the selected start time
+// to warm up the sim; historical flight data must cover it so that prespawn
+// has traffic to fly.
+const PrespawnDuration = initialSimSeconds * time.Second
+
 type RunwayLaunchState struct {
 	IFRSpawnRate float32
 	VFRSpawnRate float32
@@ -84,6 +89,30 @@ const (
 	LaunchManual
 )
 
+// TrafficSource identifies where automatic IFR traffic comes from: the
+// scenario's own traffic definitions, a built-in daily timetable, or the
+// flights that really operated at the facility on the selected date.
+type TrafficSource int32
+
+const (
+	TrafficSourceScenario TrafficSource = iota
+	TrafficSourceTimetable
+	TrafficSourceHistorical
+)
+
+func (ts TrafficSource) String() string {
+	switch ts {
+	case TrafficSourceScenario:
+		return "Scenario"
+	case TrafficSourceTimetable:
+		return "Timetable"
+	case TrafficSourceHistorical:
+		return "Historical"
+	default:
+		return "unknown"
+	}
+}
+
 // LaunchConfig collects settings related to launching aircraft in the sim; it's
 // passed back and forth between client and server: server provides them so client
 // can draw the UI for what's available, then client returns one back when launching.
@@ -96,11 +125,40 @@ type LaunchConfig struct {
 	ArrivalMode    int32
 	OverflightMode int32
 
+	// TrafficSource controls whether automatic IFR aircraft come from the
+	// scenario's own rate-based traffic generator, a built-in timetable, or
+	// historical flight data.
+	TrafficSource TrafficSource
+	// TimetableID identifies the selected built-in timetable when TrafficSource
+	// is TrafficSourceTimetable.
+	TimetableID string
+	// TimetableStartMinute is the selected local start time, expressed as
+	// minutes after midnight at the timetable's airport.
+	TimetableStartMinute int
+	// PublishedArrivalPercentage is the percentage of published IFR arrivals to
+	// use; it applies to both timetable and historical traffic.
+	PublishedArrivalPercentage int
+
+	// PublishedDeparturePercentage is the percentage of published IFR departures
+	// to use; it applies to both timetable and historical traffic.
+	PublishedDeparturePercentage int
+
 	GoAroundRate         float32
 	EnableTowerGoArounds bool
 	// airport -> runway -> category -> rate
 	DepartureRates     map[string]map[av.RunwayID]map[string]float32
 	DepartureRateScale float32
+	// airport -> runway -> category -> enabled; which flows timetable and
+	// historical traffic launch from. Scenario traffic uses the rates instead.
+	DepartureEnabled map[string]map[av.RunwayID]map[string]bool
+	// airport -> runway -> category -> the traffic there is nobody's to work.
+	// A scenario flies a neighboring airport's operations for realism, start to
+	// finish under virtual controllers; it fills out the scope but it isn't
+	// traffic the user signed up for, so it stays out of what we report they
+	// will see. Keyed like DepartureEnabled, and only the true entries are
+	// present: an absent one is traffic a human works, which is the common case
+	// and the safe assumption for a config that was never classified.
+	DepartureBackground map[string]map[av.RunwayID]map[string]bool
 
 	VFRDepartureRateScale   float32
 	VFRAirportRates         map[string]float32 // name -> VFRRateSum()
@@ -108,7 +166,16 @@ type LaunchConfig struct {
 	HaveVFRReportingRegions bool
 
 	// inbound flow -> airport / "overflights" -> rate
-	InboundFlowRates            map[string]map[string]float32
+	InboundFlowRates map[string]map[string]float32
+	// inbound flow -> airport -> enabled; which flows timetable and historical
+	// traffic land. Overflights aren't included: they are always randomly
+	// generated, so their rates apply regardless of the traffic source.
+	InboundFlowEnabled map[string]map[string]bool
+	// inbound flow -> airport -> the traffic there is nobody's to work; see
+	// DepartureBackground. Overflights are included here, under the same
+	// "overflights" key the rates use, since a flow may carry those for realism
+	// as readily as it carries arrivals.
+	InboundFlowBackground       map[string]map[string]bool
 	InboundFlowRateScale        float32
 	ArrivalPushes               bool
 	ArrivalPushFrequencyMinutes int
@@ -120,16 +187,19 @@ type LaunchConfig struct {
 func MakeLaunchConfig(dep []DepartureRunway, vfrRateScale float32, vffRequestRate int32,
 	vfrAirports map[string]*av.Airport, inbound map[string]map[string]float32, haveVFRReportingRegions bool) LaunchConfig {
 	lc := LaunchConfig{
-		GoAroundRate:                0.01,
-		DepartureRateScale:          1,
-		VFRDepartureRateScale:       vfrRateScale,
-		VFRAirportRates:             make(map[string]float32),
-		VFFRequestRate:              vffRequestRate,
-		HaveVFRReportingRegions:     haveVFRReportingRegions,
-		InboundFlowRateScale:        1,
-		ArrivalPushFrequencyMinutes: 20,
-		ArrivalPushLengthMinutes:    10,
-		EmergencyAircraftRate:       0,
+		TrafficSource:                TrafficSourceScenario,
+		PublishedArrivalPercentage:   100,
+		PublishedDeparturePercentage: 100,
+		GoAroundRate:                 0.01,
+		DepartureRateScale:           1,
+		VFRDepartureRateScale:        vfrRateScale,
+		VFRAirportRates:              make(map[string]float32),
+		VFFRequestRate:               vffRequestRate,
+		HaveVFRReportingRegions:      haveVFRReportingRegions,
+		InboundFlowRateScale:         1,
+		ArrivalPushFrequencyMinutes:  20,
+		ArrivalPushLengthMinutes:     10,
+		EmergencyAircraftRate:        0,
 	}
 
 	for icao, ap := range vfrAirports {
@@ -138,19 +208,40 @@ func MakeLaunchConfig(dep []DepartureRunway, vfrRateScale float32, vffRequestRat
 
 	// Walk the departure runways to create the map for departures.
 	lc.DepartureRates = make(map[string]map[av.RunwayID]map[string]float32)
+	lc.DepartureEnabled = make(map[string]map[av.RunwayID]map[string]bool)
 	for _, rwy := range dep {
 		if _, ok := lc.DepartureRates[rwy.Airport]; !ok {
 			lc.DepartureRates[rwy.Airport] = make(map[av.RunwayID]map[string]float32)
+			lc.DepartureEnabled[rwy.Airport] = make(map[av.RunwayID]map[string]bool)
 		}
 		if _, ok := lc.DepartureRates[rwy.Airport][rwy.Runway]; !ok {
 			lc.DepartureRates[rwy.Airport][rwy.Runway] = make(map[string]float32)
+			lc.DepartureEnabled[rwy.Airport][rwy.Runway] = make(map[string]bool)
 		}
 		lc.DepartureRates[rwy.Airport][rwy.Runway][rwy.Category] = rwy.DefaultRate
+		lc.DepartureEnabled[rwy.Airport][rwy.Runway][rwy.Category] = rwy.DefaultRate > 0
 	}
 
 	lc.InboundFlowRates = make(map[string]map[string]float32)
+	lc.InboundFlowEnabled = make(map[string]map[string]bool)
 	for flow, airportOverflights := range inbound {
 		lc.InboundFlowRates[flow] = maps.Clone(airportOverflights)
+		for ap := range airportOverflights {
+			if ap != "overflights" {
+				if lc.InboundFlowEnabled[flow] == nil {
+					lc.InboundFlowEnabled[flow] = make(map[string]bool)
+				}
+				// Every flow the scenario lists for an airport is a way into
+				// it. The rate says how much traffic the scenario's own
+				// generator should make and nothing more, so it has no bearing
+				// here: published traffic is the only thing that consults these
+				// and it arrives when its data says, not at some rate. A flow a
+				// scenario leaves dialed to zero is still one its controllers
+				// work, so start them all on and let the user turn off the ones
+				// they don't want.
+				lc.InboundFlowEnabled[flow][ap] = true
+			}
+		}
 	}
 
 	return lc
@@ -226,6 +317,59 @@ func (lc *LaunchConfig) HaveOverflights() bool {
 	return false
 }
 
+// The Worked rates are the Total ones less the traffic no human ever works, and
+// are what to report to someone deciding whether to fly a scenario: a departure
+// position whose scenario also lands a neighboring airport for realism is not
+// signing up for those arrivals. The Total rates remain what the sim will
+// generate, which is what the rate limits care about.
+
+func (lc *LaunchConfig) WorkedDepartureRate() float32 {
+	var sum float32
+	for airport, runwayRates := range lc.DepartureRates {
+		for runway, categoryRates := range runwayRates {
+			for category, rate := range categoryRates {
+				if !lc.DepartureIsBackground(airport, runway, category) {
+					sum += scaleRate(rate, lc.DepartureRateScale)
+				}
+			}
+		}
+	}
+	return sum
+}
+
+func (lc *LaunchConfig) WorkedArrivalRate() float32 {
+	return lc.workedInboundRate(false)
+}
+
+func (lc *LaunchConfig) WorkedOverflightRate() float32 {
+	return lc.workedInboundRate(true)
+}
+
+func (lc *LaunchConfig) workedInboundRate(overflights bool) float32 {
+	var sum float32
+	for flow, flowRates := range lc.InboundFlowRates {
+		for airport, rate := range flowRates {
+			if (airport == "overflights") == overflights &&
+				!lc.InboundFlowIsBackground(flow, airport) {
+				sum += scaleRate(rate, lc.InboundFlowRateScale)
+			}
+		}
+	}
+	return sum
+}
+
+// DepartureIsBackground and InboundFlowIsBackground report traffic that no human
+// controller works. They read the maps rather than indexing them directly so
+// that a launch config nobody classified--one built without a scenario to walk--
+// reports everything as the user's traffic, as it was before any of this.
+func (lc *LaunchConfig) DepartureIsBackground(airport string, runway av.RunwayID, category string) bool {
+	return lc.DepartureBackground[airport][runway][category]
+}
+
+func (lc *LaunchConfig) InboundFlowIsBackground(flow, airport string) bool {
+	return lc.InboundFlowBackground[flow][airport]
+}
+
 // CheckRateLimits returns true if both total departure rates and total inbound flow rates
 // sum to less than the provided limit (aircraft per hour)
 func (lc *LaunchConfig) CheckRateLimits(limit float32) bool {
@@ -262,6 +406,14 @@ func sumRateMap2(rates map[av.RunwayID]map[string]float32, scale float32) float3
 	return sum
 }
 
+// departureEnabledEqual reports whether two airport -> runway -> category ->
+// enabled maps hold the same values.
+func departureEnabledEqual(a, b map[string]map[av.RunwayID]map[string]bool) bool {
+	return maps.EqualFunc(a, b, func(a, b map[av.RunwayID]map[string]bool) bool {
+		return maps.EqualFunc(a, b, maps.Equal)
+	})
+}
+
 func (s *Sim) SetLaunchConfig(tcw TCW, lc LaunchConfig) error {
 	s.mu.Lock(s.lg)
 	defer s.mu.Unlock(s.lg)
@@ -281,16 +433,25 @@ func (s *Sim) SetLaunchConfig(tcw TCW, lc LaunchConfig) error {
 	}
 
 	for group, groupRates := range lc.InboundFlowRates {
+		oldRates := s.State.LaunchConfig.InboundFlowRates[group]
+
 		var newSum, oldSum float32
 		for ap, rate := range groupRates {
-			newSum += rate
-			oldSum += s.State.LaunchConfig.InboundFlowRates[group][ap]
+			if ap != "overflights" {
+				newSum += rate
+				oldSum += oldRates[ap]
+			}
 		}
 		newSum *= lc.InboundFlowRateScale
 		oldSum *= s.State.LaunchConfig.InboundFlowRateScale
-
 		if newSum != oldSum {
 			s.NextInboundSpawn[group] = s.State.SimTime.Add(randomInitialWait(newSum, s.Rand))
+		}
+
+		newOverflight := groupRates["overflights"] * lc.InboundFlowRateScale
+		oldOverflight := oldRates["overflights"] * s.State.LaunchConfig.InboundFlowRateScale
+		if newOverflight != oldOverflight {
+			s.NextOverflightSpawn[group] = s.State.SimTime.Add(randomInitialWait(newOverflight, s.Rand))
 		}
 	}
 
@@ -316,7 +477,26 @@ func (s *Sim) SetLaunchConfig(tcw TCW, lc LaunchConfig) error {
 
 	s.lg.Info("Set launch config", slog.Any("launch_config", lc))
 
+	// The timetable selection, the percentages, and the per-flow enables all
+	// decide which flights are flown, so changing any of them has to rebuild
+	// the provider's queue.
+	providerChanged := lc.TrafficSource != s.State.LaunchConfig.TrafficSource ||
+		lc.TimetableID != s.State.LaunchConfig.TimetableID ||
+		lc.TimetableStartMinute != s.State.LaunchConfig.TimetableStartMinute ||
+		lc.PublishedArrivalPercentage != s.State.LaunchConfig.PublishedArrivalPercentage ||
+		lc.PublishedDeparturePercentage != s.State.LaunchConfig.PublishedDeparturePercentage ||
+		!departureEnabledEqual(lc.DepartureEnabled, s.State.LaunchConfig.DepartureEnabled) ||
+		!maps.EqualFunc(lc.InboundFlowEnabled, s.State.LaunchConfig.InboundFlowEnabled, maps.Equal)
+
 	s.State.LaunchConfig = lc
+	if providerChanged {
+		s.trafficProvider = nil
+		for _, runways := range s.DepartureState {
+			for _, depState := range runways {
+				depState.NextIFRSpawn = s.State.SimTime
+			}
+		}
+	}
 	s.publish()
 	return nil
 }
@@ -361,7 +541,8 @@ func (s *Sim) LaunchAircraft(ac Aircraft, departureRunway av.RunwayID) {
 }
 
 func (s *Sim) addDepartureToPool(ac *Aircraft, runway av.RunwayID, manualLaunch bool) {
-	depac := makeDepartureAircraft(ac, s.State.SimTime, s.wxModel, s.Rand)
+	depac := makeDepartureAircraft(ac, s.State.SimTime, s.wxModel,
+		s.State.LaunchConfig.TrafficSource, s.Rand)
 
 	ac.WaitingForLaunch = true
 	s.addAircraftNoLock(*ac)
@@ -370,7 +551,6 @@ func (s *Sim) addDepartureToPool(ac *Aircraft, runway av.RunwayID, manualLaunch 
 	depState := s.DepartureState[ac.FlightPlan.DepartureAirport][runway]
 	if ac.FlightPlan.Rules == av.FlightRulesIFR {
 		if manualLaunch {
-			// Keep them moving and for HFR, request the release immediately.
 			depac.ReadyDepartGateTime = depac.SpawnTime
 		}
 		// IFRs spend some time at the gate to give them a chance to appear
@@ -498,11 +678,25 @@ func (s *Sim) setInitialSpawnTimes(now Time) {
 
 	for group, rates := range s.State.LaunchConfig.InboundFlowRates {
 		var rateSum float32
-		for _, rate := range rates {
-			rate = scaleRate(rate, s.State.LaunchConfig.InboundFlowRateScale)
-			rateSum += rate
+		for ap, rate := range rates {
+			if ap != "overflights" {
+				rateSum += scaleRate(rate, s.State.LaunchConfig.InboundFlowRateScale)
+			}
 		}
-		s.NextInboundSpawn[group] = randomDelay(rateSum)
+
+		nextInboundSpawn := randomDelay(rateSum)
+		if s.State.LaunchConfig.TrafficSource != TrafficSourceScenario {
+			// The published-traffic provider owns arrival timing, so ask it immediately
+			// for the next published runway-arrival event.
+			nextInboundSpawn = now
+		}
+		s.NextInboundSpawn[group] = nextInboundSpawn
+
+		// Overflights are always rate-based, no matter the traffic source.
+		if rate, ok := rates["overflights"]; ok {
+			s.NextOverflightSpawn[group] = randomDelay(
+				scaleRate(rate, s.State.LaunchConfig.InboundFlowRateScale))
+		}
 	}
 
 	for name := range s.State.DepartureAirports {
@@ -511,9 +705,15 @@ func (s *Sim) setInitialSpawnTimes(now Time) {
 		if runwayRates, ok := s.State.LaunchConfig.DepartureRates[name]; ok {
 			for rwy, rate := range runwayRates {
 				r := sumRateMap(rate, s.State.LaunchConfig.DepartureRateScale)
+				nextIFRSpawn := randomDelay(r)
+				if s.State.LaunchConfig.TrafficSource != TrafficSourceScenario {
+					// The published-traffic provider owns the timing. Ask it immediately
+					// for the next published runway departure.
+					nextIFRSpawn = now
+				}
 				s.DepartureState[name][rwy] = &RunwayLaunchState{
 					IFRSpawnRate: r,
-					NextIFRSpawn: randomDelay(r),
+					NextIFRSpawn: nextIFRSpawn,
 				}
 			}
 		}

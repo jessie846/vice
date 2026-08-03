@@ -1,9 +1,22 @@
-- New scenario: ZJX Central-Geneva (manaphy)
-- Scenario updates: ZNY (manaphy)
+- New scenario: ZJX Central-Geneva (manaphy), ZTL (AsianEvxn), ZME (Noah Hunt)
+- Scenario updates: ZNY, ZAU, C90 (manaphy), T75 (Ryan H), M98 (Shane, Logan S), ZLA, SCT (Ketan K), F11 (Michael Knight)
+- Added support for using real-world flight data in scenarios) (Shane, Logan S)
+- Added support for fix pairs for controller assignment (radarcontacto)
 - Improve logic for launching aircraft with intersection departures: ignore CWT if not aloft at the intersection
+- Fixed bug where departures would climb to cruise altitude even if they had /cALT in their upcoming route
 - Fixed bug where virtual controllers wouldn't accept redirected handoffs
-- Fixed bug where VFR aircraft could end up swarming an aircraft without being able to land
+- Fixed bug where VFR aircraft could end up swarming an airport
+- STT: fixed few bugs with fixes in an aircraft's route not being recognized
 - STARS
   - Fixed bugs with redirected handoff datablocks and recalling redirected handoffs
 - ERAM
-  - Added confict alert detection
+  - Added confict alert detection (Michael Trokel)
+- Facility engineering
+  - For STARS scenarios, aircraft are culled by default at 200nm now (was 125nm)
+  - Scenarios may now specify "default_consolidation", overriding the config's consolidation (radarcontacto)
+  - Coordination lists may specify "owner_tcp" to split one airport's release entries by assigned departure TCP (radarcontacto)
+  - Added "handoff" filters to adapt automatic handoff volumes and conditions (radarcontacto)
+  - Added pseudo-ERAM coordination: a center's "arts_coordination" and "restrictions" derive each flight's entry/exit fixes at spawn, as the enroute host would (radarcontacto)
+  - Added "fix_pair_configuration" to assign a flight's initial owning position from its entry/exit fix pair, per configuration plan, with reassignment rules (altitude, aircraft class, callsign, active runway) and RNAV route designation (radarcontacto)
+  - Added "tcp_assignment_classes" and "automatic_handoff_classes" to name aircraft classes for fix-pair and handoff-filter matching (radarcontacto)
+  - Added "automatic_scratchpad_assignment" to default a flight's scratchpads from its fixes, altitude, and flight type (radarcontacto)

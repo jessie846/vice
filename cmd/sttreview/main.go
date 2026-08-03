@@ -2,15 +2,12 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -21,29 +18,9 @@ import (
 	"github.com/mmp/vice/util"
 )
 
-// LogEntry represents an STT command log entry from the slog file.
-type LogEntry struct {
-	Time              string                  `json:"time"`
-	Level             string                  `json:"level"`
-	Msg               string                  `json:"msg"`
-	Callstack         []string                `json:"callstack,omitempty"`
-	Transcript        string                  `json:"transcript"`
-	WhisperDurationMs float64                 `json:"whisper_duration_ms,omitempty"`
-	Duration          int64                   `json:"duration,omitempty"`
-	AudioDurationMs   float64                 `json:"audio_duration_ms,omitempty"`
-	Processor         string                  `json:"processor,omitempty"`
-	WhisperModel      string                  `json:"whisper_model,omitempty"`
-	Callsign          string                  `json:"callsign"`
-	Command           string                  `json:"command"`
-	STTAircraft       map[string]stt.Aircraft `json:"stt_aircraft"`
-	Logs              []string                `json:"logs,omitempty"`
-}
-
-// PersistedState stores the review queue and seen entries between sessions.
-type PersistedState struct {
-	Queue []LogEntry      `json:"queue"`
-	Seen  map[string]bool `json:"seen"`
-}
+// LogEntry is one STT command record; the type lives in the stt package,
+// shared with the test harness and cmd/stteval.
+type LogEntry = stt.TestFile
 
 // FocusedField indicates which input field has keyboard focus.
 type FocusedField int
@@ -104,10 +81,13 @@ func main() {
 	showStatus := flag.Bool("status", false, "show queue status and exit")
 	lifoMode := flag.Bool("lifo", false, "order entries by time, most recent first")
 	catchup := flag.Bool("catchup", false, "mark all queued entries as seen and clear the queue")
+	statePathFlag := flag.String("state", stateDir+"/state.json", "review state file to load and update")
 	flag.Parse()
 
+	statePath := expandPath(*statePathFlag)
+
 	// Load persisted state
-	persisted := loadState()
+	persisted := stt.LoadReviewState(statePath)
 
 	// Handle -status
 	if *showStatus {
@@ -120,10 +100,10 @@ func main() {
 	if *catchup {
 		cleared := len(persisted.Queue)
 		for _, e := range persisted.Queue {
-			persisted.markDone(e)
+			persisted.MarkDone(e)
 		}
 		persisted.Queue = nil
-		if err := persisted.save(); err != nil {
+		if err := persisted.Save(statePath); err != nil {
 			fmt.Fprintf(os.Stderr, "Error saving state: %v\n", err)
 			os.Exit(1)
 		}
@@ -138,9 +118,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error loading file: %v\n", err)
 			os.Exit(1)
 		}
-		added := persisted.ingest(entries)
+		added := persisted.Ingest(entries)
 		fmt.Printf("Ingested %d new entries (%d already seen)\n", added, len(entries)-added)
-		if err := persisted.save(); err != nil {
+		if err := persisted.Save(statePath); err != nil {
 			fmt.Fprintf(os.Stderr, "Error saving state: %v\n", err)
 			os.Exit(1)
 		}
@@ -211,11 +191,11 @@ func main() {
 				if appState.disposition[i] == DispositionNone {
 					remaining = append(remaining, entry)
 				} else {
-					persisted.markDone(entry)
+					persisted.MarkDone(entry)
 				}
 			}
 			persisted.Queue = remaining
-			if err := persisted.save(); err != nil {
+			if err := persisted.Save(statePath); err != nil {
 				fmt.Fprintf(os.Stderr, "Error saving state: %v\n", err)
 			}
 			return
@@ -229,8 +209,14 @@ func (state *AppState) initFromEntry(entryIdx int) {
 		return
 	}
 	entry := state.entries[entryIdx]
-	callsign := strings.TrimSuffix(entry.Callsign, "/T")
-	state.correction = callsign + " " + entry.Command
+	if entry.Suggested != "" {
+		// A pre-review pass (cmd/stteval) attached a suggested correction;
+		// start from it rather than the decoder output.
+		state.correction = entry.Suggested
+	} else {
+		callsign := strings.TrimSuffix(entry.Callsign, "/T")
+		state.correction = callsign + " " + entry.Command
+	}
 	state.cursorPos = len(state.correction)
 	state.correctionEntryIdx = entryIdx
 }
@@ -301,81 +287,6 @@ func expandPath(path string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
-}
-
-// loadState loads persisted state from disk.
-func loadState() *PersistedState {
-	path := expandPath(stateDir + "/state.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return &PersistedState{Seen: make(map[string]bool)}
-	}
-	var state PersistedState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return &PersistedState{Seen: make(map[string]bool)}
-	}
-	if state.Seen == nil {
-		state.Seen = make(map[string]bool)
-	}
-
-	// Filter out any entries that are already in the Seen set and deduplicate
-	seen := make(map[string]bool)
-	var filtered []LogEntry
-	for _, e := range state.Queue {
-		h := entryHash(e)
-		if !state.Seen[h] && !seen[h] {
-			filtered = append(filtered, e)
-			seen[h] = true
-		}
-	}
-	state.Queue = filtered
-
-	return &state
-}
-
-// save persists the state to disk.
-func (s *PersistedState) save() error {
-	dir := expandPath(stateDir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "state.json"), data, 0644)
-}
-
-// ingest adds new entries to the queue, skipping already-seen ones and duplicates.
-func (s *PersistedState) ingest(entries []LogEntry) int {
-	// Build set of hashes already in queue
-	queued := make(map[string]bool)
-	for _, e := range s.Queue {
-		queued[entryHash(e)] = true
-	}
-
-	added := 0
-	for _, e := range entries {
-		h := entryHash(e)
-		if !s.Seen[h] && !queued[h] {
-			s.Queue = append(s.Queue, e)
-			queued[h] = true
-			added++
-		}
-	}
-	return added
-}
-
-// markDone marks an entry as processed.
-func (s *PersistedState) markDone(e LogEntry) {
-	s.Seen[entryHash(e)] = true
-}
-
-// entryHash computes a unique hash for an entry.
-func entryHash(e LogEntry) string {
-	h := sha256.New()
-	h.Write([]byte(e.Transcript + "|" + e.Callsign + "|" + e.Command))
-	return hex.EncodeToString(h.Sum(nil))
 }
 
 // loadEntriesFromFile parses a slog file and extracts STT command entries.
@@ -578,6 +489,7 @@ func render(screen tcell.Screen, state *AppState) {
 	styleInvalid := tcell.StyleDefault.Foreground(tcell.ColorRed).Bold(true)
 	styleContext := tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorBlack)
 	styleContextLabel := tcell.StyleDefault.Background(tcell.ColorWhite).Foreground(tcell.ColorDarkBlue).Bold(true)
+	styleReason := tcell.StyleDefault.Foreground(tcell.ColorDarkGoldenrod).Bold(true)
 	styleSaved := tcell.StyleDefault.Foreground(tcell.ColorGreen)
 	styleSkipped := tcell.StyleDefault.Foreground(tcell.ColorGray)
 	styleFocused := tcell.StyleDefault.Foreground(tcell.ColorDarkCyan).Bold(true)
@@ -618,17 +530,23 @@ func render(screen tcell.Screen, state *AppState) {
 	col1Width := 50 // Transcript
 	col2Width := 30 // Callsign + Command
 
-	// Adjust widths based on screen size
-	if col1Width+col2Width+8 > width {
-		col1Width = width - col2Width - 8
-		if col1Width < 30 {
-			col1Width = 30
-			col2Width = width - col1Width - 8
+	// Layout chrome: a 3-column prefix plus a 3-char " │ " separator before
+	// each of columns 2 and 3. The correction column gets whatever remains.
+	const chrome = 3 + 3 + 3
+	col3Width := width - chrome - col1Width - col2Width
+	if col3Width < 20 {
+		// Too narrow for the full transcript column; borrow from it first,
+		// then from the callsign column, keeping the correction visible.
+		col1Width = width - chrome - col2Width - 20
+		if col1Width < 20 {
+			col1Width = 20
+			col2Width = width - chrome - col1Width - 20
 		}
+		col3Width = 20
 	}
-
-	// Correction column gets all remaining width
-	col3Width := width - 3 - col1Width - 3 - col2Width - 3
+	col1Width = max(col1Width, 0)
+	col2Width = max(col2Width, 0)
+	col3Width = max(col3Width, 0)
 
 	headerLine := fmt.Sprintf("   %-*s │ %-*s │ %-*s",
 		col1Width, "TRANSCRIPT",
@@ -641,9 +559,25 @@ func render(screen tcell.Screen, state *AppState) {
 	drawText(screen, 0, y, width, styleDefault, strings.Repeat("─", width))
 	y++
 
+	// Reserve rows at the bottom for the selected entry's diagnosis note
+	// (why it is a suspect / why the suggested correction), when present.
+	var reasonLines []string
+	if e := state.getSelectedEntry(); e != nil && e.Reason != "" {
+		reasonLines = wrapText("Why: "+e.Reason, width, width)
+		if len(reasonLines) > 3 {
+			reasonLines = reasonLines[:3]
+		}
+	}
+	// When the context pane is open the note is shown inside it (beneath the
+	// other entries), so only reserve the bottom rows in the compact view.
+	bottomReserve := 0
+	if len(reasonLines) > 0 && !state.showContext {
+		bottomReserve = len(reasonLines) + 1 // + separator row
+	}
+
 	// Calculate visible area
 	listStartY := y
-	listEndY := height - 2 // Leave room for help line
+	listEndY := height - 2 - bottomReserve // Leave room for help + reason note
 	if state.showContext {
 		// In context mode, only show the selected entry to ensure full transcript is visible
 		state.scrollOffset = state.selectedIndex
@@ -766,7 +700,7 @@ func render(screen tcell.Screen, state *AppState) {
 		entry := state.getSelectedEntry()
 		if entry != nil {
 			y++ // blank line
-			maxY := height - 2
+			maxY := height - 2 - bottomReserve
 			entryCallsign := strings.TrimSuffix(entry.Callsign, "/T")
 
 			// Show whisper model if available
@@ -801,6 +735,26 @@ func render(screen tcell.Screen, state *AppState) {
 						info += fmt.Sprintf("   STAR: %s", ac.STAR)
 					}
 					drawText(screen, 0, y, width, styleContext, fmt.Sprintf("%-*s", width, info))
+					y++
+				}
+
+				// Heading / speed, with assigned values when present.
+				if y < maxY {
+					hdg := fmt.Sprintf("%d", ac.Heading)
+					if ac.AssignedHeading != 0 {
+						hdg += fmt.Sprintf(" (assigned %d)", ac.AssignedHeading)
+					}
+					spd := fmt.Sprintf("%d", ac.Speed)
+					if ac.AssignedSpeed != 0 {
+						spd += fmt.Sprintf(" (assigned %d)", ac.AssignedSpeed)
+					} else if ac.AssignedMach != 0 {
+						spd += fmt.Sprintf(" (assigned M.%02d)", ac.AssignedMach)
+					}
+					fs := fmt.Sprintf(" Heading: %s   Speed: %s", hdg, spd)
+					if ac.AssignedAltitude != 0 {
+						fs += fmt.Sprintf("   Assigned alt: %d", ac.AssignedAltitude)
+					}
+					drawText(screen, 0, y, width, styleContext, fmt.Sprintf("%-*s", width, fs))
 					y++
 				}
 
@@ -1003,11 +957,36 @@ func render(screen tcell.Screen, state *AppState) {
 				}
 			}
 
+			// Diagnosis note, beneath the other context entries.
+			if entry.Reason != "" && y < maxY {
+				drawText(screen, 0, y, width, styleContext, strings.Repeat(" ", width))
+				drawText(screen, 0, y, width, styleContextLabel, " Why:")
+				y++
+				for _, ln := range wrapText(entry.Reason, width-2, width-2) {
+					if y >= maxY {
+						break
+					}
+					drawText(screen, 0, y, width, styleContext, fmt.Sprintf("%-*s", width, " "+ln))
+					y++
+				}
+			}
+
 			// Fill remaining context area with white
 			for y < maxY {
 				drawText(screen, 0, y, width, styleContext, strings.Repeat(" ", width))
 				y++
 			}
+		}
+	}
+
+	// Diagnosis note for the selected entry, just above the help footer
+	// (compact view only; the context pane shows it inline).
+	if len(reasonLines) > 0 && !state.showContext {
+		ry := height - 1 - len(reasonLines)
+		drawText(screen, 0, ry-1, width, styleDefault, strings.Repeat("─", width))
+		for _, ln := range reasonLines {
+			drawText(screen, 0, ry, width, styleReason, fmt.Sprintf("%-*s", width, ln))
+			ry++
 		}
 	}
 
@@ -1041,6 +1020,9 @@ func drawText(screen tcell.Screen, x, y, maxWidth int, style tcell.Style, text s
 
 // truncate truncates a string to fit within maxLen.
 func truncate(s string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
 	if len(s) <= maxLen {
 		return s
 	}
@@ -1261,6 +1243,13 @@ func handleCorrectionInput(ev *tcell.EventKey, state *AppState) Action {
 // saveEntry saves an entry to the output directory as a test case.
 // Returns the path of the saved file.
 func saveEntry(entry LogEntry, correction, outputDir string) (string, error) {
+	// Carry the diagnosis rationale into the saved test — but only when the
+	// reviewer accepted the proposed correction verbatim. If they overrode
+	// it (or there was no proposal), the stored reason describes a different
+	// answer and would mislead a later fix pass, so drop it.
+	keepReason := entry.Reason != "" && entry.Suggested != "" &&
+		strings.TrimSpace(correction) == strings.TrimSpace(entry.Suggested)
+
 	// Parse correction if provided
 	if correction != "" {
 		callsign, command, valid := parseCorrection(correction, entry)
@@ -1270,6 +1259,11 @@ func saveEntry(entry LogEntry, correction, outputDir string) (string, error) {
 		entry.Callsign = callsign
 		entry.Command = command
 	}
+	// The suggestion is review-time metadata, not part of the test case.
+	entry.Suggested = ""
+	if !keepReason {
+		entry.Reason = ""
+	}
 
 	// Create output directory if needed
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -1277,11 +1271,11 @@ func saveEntry(entry LogEntry, correction, outputDir string) (string, error) {
 	}
 
 	// Generate filename from transcript
-	filename := sanitizeFilename(entry.Transcript) + ".json"
+	filename := stt.SanitizeTestFilename(entry.Transcript) + ".json"
 	path := filepath.Join(outputDir, filename)
 
 	// Handle collision by adding suffix
-	base := sanitizeFilename(entry.Transcript)
+	base := stt.SanitizeTestFilename(entry.Transcript)
 	for i := 1; fileExists(path); i++ {
 		path = filepath.Join(outputDir, fmt.Sprintf("%s_%d.json", base, i))
 	}
@@ -1310,29 +1304,6 @@ func extractExpectApproachID(command string) string {
 		}
 	}
 	return ""
-}
-
-// sanitizeFilename creates a safe filename from a transcript.
-func sanitizeFilename(transcript string) string {
-	// Convert to lowercase and replace spaces with underscores
-	s := strings.ToLower(transcript)
-	s = strings.ReplaceAll(s, " ", "_")
-
-	// Remove non-alphanumeric characters except underscores
-	reg := regexp.MustCompile(`[^a-z0-9_]`)
-	s = reg.ReplaceAllString(s, "")
-
-	// Truncate to reasonable length
-	if len(s) > 50 {
-		s = s[:50]
-	}
-
-	// Handle empty result
-	if s == "" {
-		s = "entry"
-	}
-
-	return s
 }
 
 // fileExists checks if a file exists.

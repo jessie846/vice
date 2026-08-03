@@ -24,6 +24,7 @@ func registerAllCommands() {
 		WithName("descend"),
 		WithPriority(5),
 		WithThenVariant("TD%d"),
+		WithSayAgainOnFail(), // "descend {garbled}" should ask for the altitude again
 	)
 
 	registerSTTCommand(
@@ -48,6 +49,7 @@ func registerAllCommands() {
 		func(alt int) string { return fmt.Sprintf("A%d", alt) },
 		WithName("maintain_altitude"),
 		WithPriority(3),
+		WithThenVariant("TA%d"),
 	)
 
 	// Standalone altitude - catches cases where the command keyword is garbled
@@ -61,11 +63,27 @@ func registerAllCommands() {
 		WithPriority(1), // Very low priority - only matches if nothing else does
 	)
 
-	// "{altitude} until established [on] [the] [localizer|glide|slope|glideslope]"
+	// "{altitude} until established [on] [the] [localizer|glideslope|final approach course]"
+	// The trailing "on the localizer" / "on the final approach course" clause is
+	// informational and folded into the altitude command. The preposition is loose
+	// ("on" is often mis-transcribed as "from") and the object list covers the
+	// localizer, glideslope, and final approach course phrasings; unless the whole
+	// clause is absorbed here, a dangling "localizer" gets misread as an approach
+	// clearance (e.g., "cleared ILS 28R" → CY8R).
 	registerSTTCommand(
-		"{standalone_altitude} until established|establishing [on] [the] [localizer|glide|slope|glideslope]",
+		"{standalone_altitude} until established|establishing [on|from|onto|of] [the] [localizer|glideslope|glide|slope|final] [approach] [course]",
 		func(alt int) string { return fmt.Sprintf("A%d", alt) },
 		WithName("altitude_until_established"),
+		WithPriority(12),
+	)
+
+	// Absorb a standalone "until established on the localizer / final approach
+	// course" clause (said without a preceding altitude) so its trailing
+	// "localizer" isn't misread as an approach clearance.
+	registerSTTCommand(
+		"until established|establishing [on|from|onto|of] [the] [localizer|glideslope|glide|slope|final] [approach] [course]",
+		func() string { return "" },
+		WithName("until_established"),
 		WithPriority(12),
 	)
 
@@ -111,6 +129,16 @@ func registerAllCommands() {
 		func() string { return "ED" },
 		WithName("expedite_descent"),
 		WithPriority(10),
+	)
+
+	// Bare "expedite" with no direction word ("descend four thousand
+	// expedite"): the direction is taken from the preceding altitude command
+	// in post-processing (resolveExpedite), defaulting to descend.
+	registerSTTCommand(
+		"expedite",
+		func() string { return "EXPEDITE" },
+		WithName("expedite_bare"),
+		WithPriority(8),
 	)
 
 	registerSTTCommand(
@@ -299,6 +327,16 @@ func registerAllCommands() {
 		WithPriority(12),
 	)
 
+	// "maintain present/current heading" - "maintain" is required so a bare
+	// "current heading" can't fire on garbles like "turret heading" (a
+	// misheard "turn right heading NNN") and swallow the heading value.
+	registerSTTCommand(
+		"maintain present|current heading",
+		func() string { return "H" },
+		WithName("maintain_present_heading"),
+		WithPriority(12),
+	)
+
 	// Fallback for cut-off transcripts like "fly present hap-" where STT loses
 	// the "heading" token. Requires literal "fly" so it can't fire on phrases
 	// like "maintain present speed".
@@ -330,6 +368,16 @@ func registerAllCommands() {
 		"turn [to] {num:100-360}",
 		func(hdg int) string { return fmt.Sprintf("H%03d", hdg) },
 		WithName("turn_heading_bare"),
+		WithPriority(3),
+	)
+
+	// Same, for headings below 100: those must be spoken with an explicit
+	// leading zero ("zero five zero"), which callsign fragments and other
+	// stray numbers never carry, so the range guard above isn't needed.
+	registerSTTCommand(
+		"turn [to] {heading_leading_zero}",
+		func(hdg int) string { return fmt.Sprintf("H%03d", hdg) },
+		WithName("turn_heading_leading_zero"),
 		WithPriority(3),
 	)
 
@@ -373,6 +421,17 @@ func registerAllCommands() {
 		WithThenVariant("TS%d"),
 	)
 
+	// "speed" with a single-digit value ("speed eight to descend...",
+	// "speed one maybe"): no repair yields a valid speed, but a value was
+	// clearly attempted — ask for it again. Two-digit values are handled
+	// by the dropped-zero repairs above and never reach this.
+	registerSTTCommand(
+		"speed [to] {num:1-9}",
+		func(int) string { return "SAYAGAIN/SPEED" },
+		WithName("speed_garbled_value"),
+		WithPriority(3),
+	)
+
 	registerSTTCommand(
 		"maintain [speed] {speed}",
 		func(spd int) string { return fmt.Sprintf("S%d", spd) },
@@ -380,6 +439,16 @@ func registerAllCommands() {
 		WithPriority(2),
 		WithThenVariant("TS%d"),
 		WithSayAgainOnFail(),
+	)
+
+	// An explicit "level" reads as flight level even without "flight"
+	// ("maintain level two eight zero"); outranks the speed reading of
+	// the same number.
+	registerSTTCommand(
+		"maintain level {altitude_fl}",
+		func(alt int) string { return fmt.Sprintf("A%d", alt) },
+		WithName("maintain_flight_level"),
+		WithPriority(4),
 	)
 
 	registerSTTCommand(
@@ -464,9 +533,26 @@ func registerAllCommands() {
 	)
 
 	registerSTTCommand(
-		"[maintain] {speed} or greater|better",
+		"[maintain] {speed} [knots] or greater|better",
 		func(spd int) string { return fmt.Sprintf("S%d+", spd) },
 		WithName("speed_or_greater"),
+		WithPriority(12),
+		WithThenVariant("TS%d+"),
+	)
+
+	registerSTTCommand(
+		"speed [to] {speed} [knots] or greater|better {speed_until}",
+		func(spd int, until speedUntilResult) string {
+			return fmt.Sprintf("S%d+/U%s", spd, until.suffix)
+		},
+		WithName("speed_keyword_or_greater_until"),
+		WithPriority(15),
+	)
+
+	registerSTTCommand(
+		"speed [to] {speed} [knots] or greater|better",
+		func(spd int) string { return fmt.Sprintf("S%d+", spd) },
+		WithName("speed_keyword_or_greater"),
 		WithPriority(12),
 		WithThenVariant("TS%d+"),
 	)
@@ -550,6 +636,16 @@ func registerAllCommands() {
 		WithPriority(12),
 	)
 
+	// Catch-all: any garbled verb before "speed restrictions" is a cancel
+	// ("Neleep speed restrictions" for "delete speed restrictions"). The
+	// distinctive "speed restrictions" tail carries the intent.
+	registerSTTCommand(
+		"{garbled_word} speed restrictions|restriction",
+		func(_ string) string { return "S" },
+		WithName("garbled_cancel_speed_restrictions"),
+		WithPriority(6),
+	)
+
 	registerSTTCommand(
 		"reduce|slow [to] final|minimum [approach] [speed]",
 		func() string { return "SMIN" },
@@ -588,11 +684,22 @@ func registerAllCommands() {
 		WithPriority(18),
 	)
 
+	// "have you maintained two two zero knots": a confirmation question
+	// that assigns the speed. "maintained" is blocklisted against fuzzy
+	// "maintain" (it is usually a readback echo), so this literal template
+	// carries the reading; "knots" is required to anchor it to speed.
+	registerSTTCommand(
+		"maintained {speed} knots",
+		func(spd int) string { return fmt.Sprintf("S%d", spd) },
+		WithName("maintained_speed_question"),
+		WithPriority(8),
+	)
+
 	// Speed until commands - higher priority to match before regular speed commands
 	registerSTTCommand(
 		"reduce|slow [speed] [to] {speed} {speed_until}",
 		func(spd int, until speedUntilResult) string {
-			return fmt.Sprintf("S%d/U%s", spd, until.suffix)
+			return fmt.Sprintf("S%d%s/U%s", spd, until.mod(), until.suffix)
 		},
 		WithName("reduce_speed_until"),
 		WithPriority(15),
@@ -601,7 +708,7 @@ func registerAllCommands() {
 	registerSTTCommand(
 		"increase [speed] [to] {speed} {speed_until}",
 		func(spd int, until speedUntilResult) string {
-			return fmt.Sprintf("S%d/U%s", spd, until.suffix)
+			return fmt.Sprintf("S%d%s/U%s", spd, until.mod(), until.suffix)
 		},
 		WithName("increase_speed_until"),
 		WithPriority(15),
@@ -610,7 +717,7 @@ func registerAllCommands() {
 	registerSTTCommand(
 		"speed [to] {speed} {speed_until}",
 		func(spd int, until speedUntilResult) string {
-			return fmt.Sprintf("S%d/U%s", spd, until.suffix)
+			return fmt.Sprintf("S%d%s/U%s", spd, until.mod(), until.suffix)
 		},
 		WithName("speed_until"),
 		WithPriority(12),
@@ -619,7 +726,7 @@ func registerAllCommands() {
 	registerSTTCommand(
 		"maintain [speed] {speed} {speed_until}",
 		func(spd int, until speedUntilResult) string {
-			return fmt.Sprintf("S%d/U%s", spd, until.suffix)
+			return fmt.Sprintf("S%d%s/U%s", spd, until.mod(), until.suffix)
 		},
 		WithName("maintain_speed_until"),
 		WithPriority(12),
@@ -771,6 +878,7 @@ func registerAllCommands() {
 		func(fix string) string { return fmt.Sprintf("D%s", fix) },
 		WithName("direct_fix"),
 		WithPriority(10),
+		WithSayAgainOnFail(), // "direct {unrecognizable}" should ask for the fix again
 	)
 
 	// "cleared direct [fix]" - SAYAGAIN when fix is garbled.
@@ -1393,11 +1501,32 @@ func registerAllCommands() {
 	)
 
 	registerSTTCommand(
-		"expect [vectors] [for] [to] [the] {approach_lahso}",
+		"expect [vectors] [for] [to] [the] {approach_expect_lahso}",
 		func(appr string) string { return fmt.Sprintf("E%s", appr) },
 		WithName("expect_approach"),
 		WithPriority(15),     // Higher than heading commands to match approach context first
 		WithSayAgainOnFail(), // "expect [approach]" should ask for clarification if approach unrecognized
+	)
+
+	// "expect cleared ILS two six": the clearance verb wins — this is an
+	// approach clearance, with "expect" as a slip of the tongue.
+	registerSTTCommand(
+		"expect cleared [approach] [for] {approach}",
+		func(appr string) string { return fmt.Sprintf("C%s", appr) },
+		WithName("expect_cleared_approach"),
+		WithPriority(16),
+		WithSayAgainOnFail(),
+	)
+
+	// "maintain that until {fix}": "that" refers to the speed just
+	// assigned ("release speed to one eight zero, maintain that until
+	// Dennis"). Emits a marker that post-processing folds into the
+	// preceding speed command as an until-fix restriction.
+	registerSTTCommand(
+		"maintain that|it until {fix}",
+		func(fix string) string { return "UNTILFIX/" + fix },
+		WithName("maintain_that_until_fix"),
+		WithPriority(16),
 	)
 
 	// "standby for the approach" is informational — swallow it silently.
@@ -1603,7 +1732,19 @@ func registerAllCommands() {
 		"radar contact",
 		func() string { return "" }, // Informational only
 		WithName("radar_contact_info"),
+		WithKind(kindInformational),
 		WithPriority(20),
+	)
+
+	// "contact one five miles south of Kennedy": "radar" was dropped from
+	// "radar contact"; the distance-and-bearing position report gives it
+	// away — a handoff never has one.
+	registerSTTCommand(
+		"contact {num:1-99} miles [{compass_dir}]",
+		func(int, *string) string { return "" },
+		WithName("radar_contact_position"),
+		WithKind(kindInformational),
+		WithPriority(18),
 	)
 
 	// Contact tower patterns - need to handle "contact <facility> tower"
@@ -1632,6 +1773,22 @@ func registerAllCommands() {
 		},
 		WithName("facility_tower"),
 		WithPriority(5),
+	)
+	// Bare "tower <freq>" or "tower <garble>" when the callsign consumed the
+	// word that would otherwise precede "tower" (e.g. "Endeavor 66 tower
+	// 118.7", "Fedex 92 15 tower charlie"). Low priority so the "contact ..."
+	// and "{facility} tower" patterns win when their context is present.
+	registerSTTCommand(
+		"tower {frequency_value}",
+		func(freq av.Frequency) string { return fmt.Sprintf("TO/%d", int(freq)) },
+		WithName("bare_tower_freq"),
+		WithPriority(4),
+	)
+	registerSTTCommand(
+		"tower {garbled_word}",
+		func(_ string) string { return "TO" },
+		WithName("bare_tower_word"),
+		WithPriority(2),
 	)
 	// Pattern: "contact Kennedy Tower" or "contact Lindbergh Tower"
 	// The {text} parameter consumes one token (the facility name)
@@ -1672,9 +1829,8 @@ func registerAllCommands() {
 	// If we clearly heard "contact" but what follows is too short to be a frequency,
 	// it's most likely "contact tower" with a garbled "tower".
 	// Uses {garbled_word} to avoid matching command keywords like "climb".
-	// Lower priority than FC patterns so those match first when applicable.
 	registerSTTCommand(
-		"contact {garbled_word}",
+		"contact {garbled_word_final}",
 		func(_ string) string { return "TO" },
 		WithName("contact_garbled_tower"),
 		WithPriority(2),
@@ -1714,6 +1870,16 @@ func registerAllCommands() {
 		func() string { return "RST" },
 		WithName("radar_services_terminated"),
 		WithPriority(15),
+	)
+
+	// "unable" is a pilot word; a transmission consisting of it was
+	// misattributed or is a readback — no response.
+	registerSTTCommand(
+		"unable",
+		func() string { return "" },
+		WithName("unable"),
+		WithKind(kindAcknowledgment),
+		WithPriority(10),
 	)
 
 	registerSTTCommand(
@@ -1786,6 +1952,21 @@ func registerAllCommands() {
 		WithPriority(15),
 	)
 
+	// The traffic description that follows a wake-turbulence advisory
+	// ("you will follow a heavy Boeing triple seven"). Consuming it as
+	// informational keeps the type digits from being misread as a heading
+	// or altitude command. "heavy"/"heavier" between "follow" and the type
+	// is absorbed by filler skipping and slot slack; listing them as
+	// optionals would let "heading" fuzzy-match "heavier" and hijack "fly
+	// heading 330" (A330 is a type number).
+	registerSTTCommand(
+		"follow [a|the] {aircraft_type}",
+		func(_ string) string { return "" },
+		WithName("follow_traffic_type"),
+		WithKind(kindInformational),
+		WithPriority(10),
+	)
+
 	// === ATIS INFORMATION ===
 	registerSTTCommand(
 		"information {atis_letter} [is] [current]",
@@ -1810,19 +1991,11 @@ func registerAllCommands() {
 
 	// === AIRPORT ADVISORY ===
 	registerSTTCommand(
-		"[the] airport [is] [will] [be] [at] [your] {num:1-12} o'clock {num:1-50} [miles|mile] [report] [the] [field|airport] [in] [sight]",
+		"[the] airport|field [is|its] [gonna] [will] [be] [at] [your] {num:1-12} o'clock {num:1-50} [miles|mile] [report] [the] [field|airport] [in] [sight]",
 		func(oclock int, miles int) string {
 			return fmt.Sprintf("AP/%d/%d", oclock, miles)
 		},
 		WithName("airport_advisory"),
-		WithPriority(10),
-	)
-	registerSTTCommand(
-		"[the] field [is] [will] [be] [at] [your] {num:1-12} o'clock {num:1-50} [miles|mile] [report] [the] [field|airport] [in] [sight]",
-		func(oclock int, miles int) string {
-			return fmt.Sprintf("AP/%d/%d", oclock, miles)
-		},
-		WithName("airport_advisory_field"),
 		WithPriority(10),
 	)
 	registerSTTCommand(
@@ -1889,6 +2062,58 @@ func registerAllCommands() {
 		WithName("traffic_and_airport_in_sight"),
 		WithPriority(15),
 	)
+
+	// === INFORMATIONAL / DISCOURSE SEGMENTS ===
+	// These consume tokens without issuing commands. Their kind lets the
+	// output assembly recognize acknowledgment-only, position-ID-only, and
+	// handoff transmissions from what was matched, rather than from
+	// positional token stripping.
+
+	registerSTTCommand(
+		"roger|wilco|copy|affirm|affirmative",
+		func() string { return "" },
+		WithName("acknowledgment"),
+		WithKind(kindAcknowledgment),
+	)
+
+	registerSTTCommand(
+		"hello|hey|hi|howdy",
+		func() string { return "" },
+		WithName("greeting"),
+		WithKind(kindAcknowledgment),
+	)
+
+	// Controller position identification ("New York departure", "Boston
+	// approach"): up to two facility-name words before the position word.
+	// Absorbing the facility words matters: it makes this a real match at
+	// the head of the phrase, so a command template cannot poach garbled
+	// facility words ("bah SET approach") out of the middle of it. The
+	// beam only accepts this near the start of the transmission.
+	registerSTTCommand(
+		"[{facility_word}] [{facility_word}] departure|approach|center",
+		func(_, _ *string) string { return "" },
+		WithName("position_id"),
+		WithKind(kindPositionID),
+		// Weak evidence: any real command template at the same anchor wins.
+		WithPriority(1),
+	)
+
+	// Sign-off pleasantries; "one" in "have a good one" tokenizes as the
+	// digit 1.
+	registerSTTCommand(
+		"have [a] good|nice|great day|night|evening|one|1",
+		func() string { return "" },
+		WithName("sign_off_have"),
+		WithKind(kindSignOff),
+	)
+
+	registerSTTCommand(
+		"good day|night|evening|morning",
+		func() string { return "" },
+		WithName("sign_off_good"),
+		WithKind(kindSignOff),
+	)
+
 }
 
 func formatTrafficCommand(tr trafficResult) string {

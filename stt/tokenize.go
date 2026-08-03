@@ -39,16 +39,23 @@ func Tokenize(words []string) []Token {
 	for i < len(words) {
 		w := words[i]
 
-		// Check for "flight level" pattern
-		if w == "flight" && i+1 < len(words) && words[i+1] == "level" {
-			fl, consumed := parseFlightLevel(words[i+2:])
+		// Check for "flight level" pattern ("fl" is the standard
+		// abbreviation, often produced by STT; "flight" itself may be
+		// garbled, e.g. "fight level")
+		if flWords := 0; w == "fl" || (i+1 < len(words) && WordScore(w, "flight") >= 0.8 && WordScore(words[i+1], "level") >= 0.8) {
+			if w == "fl" {
+				flWords = 1
+			} else {
+				flWords = 2
+			}
+			fl, consumed := parseFlightLevel(words[i+flWords:])
 			if consumed > 0 {
 				tokens = append(tokens, Token{
 					Text:  "FL" + strconv.Itoa(fl),
 					Type:  TokenAltitude,
 					Value: fl,
 				})
-				i += 2 + consumed
+				i += flWords + consumed
 				continue
 			}
 		}
@@ -219,7 +226,7 @@ func parseAltitudePattern(words []string) (int, int) {
 				// Numbers 61-99 before "thousand" represent garbled altitudes
 				// like "76 thousand" (STT for "seven thousand six hundred" = 7,600 ft).
 				// The tens digit is thousands and the units digit is hundreds.
-				if consumed+1 < len(words) && FuzzyMatch(words[consumed+1], "thousand", 0.90) {
+				if consumed+1 < len(words) && isThousandWord(words[consumed+1]) {
 					return n, consumed + 2
 				}
 				break
@@ -237,7 +244,7 @@ func parseAltitudePattern(words []string) (int, int) {
 	}
 
 	// Must have "thousand" next (fuzzy match to handle STT errors like "thousandth")
-	if !FuzzyMatch(words[consumed], "thousand", 0.90) {
+	if !isThousandWord(words[consumed]) {
 		return 0, 0
 	}
 	consumed++
@@ -277,6 +284,14 @@ func parseAltitudePattern(words []string) (int, int) {
 	return altitude, consumed
 }
 
+// isThousandWord reports whether a word reads as "thousand" (fuzzy, to
+// handle STT errors like "thousandth"). Words with a curated confusion
+// reading are excluded: "designed" is a garbled "descend" even though its
+// metaphone coincides with "thousand"'s.
+func isThousandWord(w string) bool {
+	return len(confusionTable[strings.ToLower(w)]) == 0 && FuzzyMatch(w, "thousand", 0.90)
+}
+
 // parseDigitSequence parses consecutive number tokens into a number.
 // Handles both single digits and multi-digit numbers from normalization.
 // Returns the number, the text representation (preserving leading zeros), and words consumed.
@@ -303,10 +318,14 @@ func parseDigitSequence(words []string) (int, string, int) {
 					break // Let this digit start a new sequence with the large number
 				}
 			}
-			// Don't merge a single digit if "thousand" follows - it's part of an altitude
-			// pattern like "18 3 thousand" where "3 thousand" means 3000 feet.
-			if num > 0 && consumed+1 < len(words) && words[consumed+1] == "thousand" {
-				break // Let this digit be parsed with "thousand" as an altitude
+			// Don't merge a digit that starts an altitude pattern — "18 3
+			// thousand" splits before the "3" ("3 thousand" = 3,000 ft), and
+			// "87 18 1 2 thousand" splits before the "1" ("1 2 thousand" =
+			// 12,000 ft).
+			if num > 0 {
+				if _, altConsumed := parseAltitudePattern(words[consumed:]); altConsumed > 0 {
+					break
+				}
 			}
 			// Don't merge a single digit if "mile"/"miles" follows and we already
 			// have a meaningful number. This prevents "speed 180 5 miles final"

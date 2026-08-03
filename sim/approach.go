@@ -434,9 +434,11 @@ func (s *Sim) checkAirportVisibility(ac *Aircraft) VisualEligibility {
 	arrivalAirport := ac.FlightPlan.ArrivalAirport
 	ap := s.State.Airports[arrivalAirport]
 
-	// Must be VMC at the arrival airport.
+	// Must be VMC at the arrival airport. If there's no METAR for the airport
+	// (e.g. a newly added TRACON whose weather hasn't been ingested yet),
+	// assume VMC.
 	metar, ok := s.State.METAR[arrivalAirport]
-	if !ok || !metar.IsVMC() {
+	if ok && !metar.IsVMC() {
 		return VisualEligibility{Reason: visualEligibilityIMC}
 	}
 
@@ -492,6 +494,11 @@ const (
 	pilotLookDurationMin = 10 * time.Second
 	pilotLookDurationMax = 20 * time.Second
 	pilotNoReportProb    = 0.12 // probability a "looking" pilot never speaks up this window
+
+	// Above this height AGL, arrivals won't *spontaneously* report the field in
+	// sight; they wait until descended into the terminal environment. Does not
+	// affect controller-prompted (AP command) reports.
+	maxSpontaneousFieldInSightAGL = 8000 // ft AGL
 )
 
 // pilotSeeProb returns a probability (0..1) that a pilot can visually
@@ -528,6 +535,12 @@ func pilotSeeProb(effectiveRangeNM, distNM float32) float32 {
 //     function via canRequestVisualApproach.
 func (s *Sim) checkSpontaneousVisualRequest(ac *Aircraft) {
 	if !ac.canRequestVisualApproach() || s.hasPendingCheckIn(ac.ADSBCallsign) {
+		return
+	}
+
+	// Don't spontaneously report the field in sight from high altitude; wait
+	// until the aircraft has descended into the terminal environment.
+	if ac.Altitude()-ac.ArrivalAirportElevation() > maxSpontaneousFieldInSightAGL {
 		return
 	}
 

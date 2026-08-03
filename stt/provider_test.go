@@ -1,14 +1,12 @@
 package stt
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	av "github.com/mmp/vice/aviation"
-	"github.com/mmp/vice/sim"
 )
 
 // TestMain initializes the aviation database and STT registries for all tests.
@@ -588,6 +586,77 @@ func TestCompoundSpeedCommands(t *testing.T) {
 				"Delta 200": {Callsign: "DAL200", State: "arrival", Fixes: map[string]string{"MILTT": "MILTT"}},
 			},
 			expected: "DAL200 TO/132220 S170/UMILTT",
+		},
+		{
+			// Regression: "maintain SPEED until FIX, contact <facility> tower FREQ".
+			// The compound-speed pattern ("maintain X until FIX then Y") must not
+			// reach across the "contact" boundary to grab the tower frequency as a
+			// phantom second speed segment. Previously this parsed as
+			// S160/UGREKO/180 — the tower frequency 118(.7) was skipped into by the
+			// second-speed matcher and teen/ty-confused into 180. Speed-until and
+			// the tower handoff are distinct commands.
+			name:       "maintain speed until fix then contact facility tower with frequency",
+			transcript: "Air Canada Forty Eight Ninety Two reduced speed will maintain one six zero knots until Greko contact La Guardia tower one one eight point seven good night",
+			aircraft: map[string]Aircraft{
+				"Air Canada Forty Eight Ninety Two": {Callsign: "ACA4892", State: "arrival", Fixes: map[string]string{"Greko": "GREKO"}},
+			},
+			expected: "ACA4892 S160/UGREKO TO/118700",
+		},
+	}
+
+	provider := NewTranscriber(nil)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := provider.DecodeTranscript(tt.aircraft, tt.transcript, "")
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			if result != tt.expected {
+				t.Errorf("got %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestATISInformation(t *testing.T) {
+	tests := []struct {
+		name       string
+		transcript string
+		aircraft   map[string]Aircraft
+		expected   string
+	}{
+		{
+			name:       "atis acknowledgment",
+			transcript: "Delta 200 Boston Approach information Bravo is current",
+			aircraft: map[string]Aircraft{
+				"Delta 200": {Callsign: "DAL200", State: "arrival"},
+			},
+			expected: "DAL200 ATIS/B",
+		},
+		{
+			// Regression: the leading "at" of the "at {fix} cleared {approach}"
+			// (and "at {fix} {speed}") handlers fuzzy-matched the word "ATIS",
+			// letting those handlers hijack the "ATIS information Mike is current"
+			// phrase whenever a following word collided with a route fix. Here the
+			// fix "MYNEE" collides with the spoken "Mike", so the whole ATIS phrase
+			// was consumed into a phantom "AMYNEE/..." command and the ATIS
+			// acknowledgment was lost. "atis" must not match "at".
+			name:       "atis phrase not hijacked by at-fix when a word collides with a fix",
+			transcript: "Spirit Winds Fifty Nine Twenty Six Norcal Approach ATIS Information Mike is current the Oakland Altimator Three Zero Zero Six expect ILS runway three zero approach",
+			aircraft: map[string]Aircraft{
+				"Spirit Wings Fifty Nine Twenty Six": {
+					Callsign: "NKS5926",
+					State:    "arrival",
+					Fixes:    map[string]string{"Mike": "MYNEE"},
+					CandidateApproaches: map[string]string{
+						"I L S runway three zero": "I30",
+					},
+					ApproachFixes: map[string]map[string]string{"I30": {"Mynee": "MYNEE"}},
+				},
+			},
+			expected: "NKS5926 ATIS/M EI30",
 		},
 	}
 
@@ -2053,13 +2122,16 @@ func TestNormalizeTranscript(t *testing.T) {
 		{"turn left disregard turn right", []string{"turn", "left", "disregard", "turn", "right"}},
 		{"1-1-thousand", []string{"1", "1", "thousand"}}, // Hyphens split into separate words
 		// "niner" sometimes transcribed as "nine or" - should skip "or" between digits
-		{"two nine or zero", []string{"2", "9", "0"}},
+		// "or" noise between digits passes through; matching absorbs it.
+		{"two nine or zero", []string{"2", "9", "or", "0"}},
 		{"heading two niner zero", []string{"heading", "2", "9", "0"}},
 		{"", nil},
-		// "niner thousand" transcribed as "9 or 1000" - should convert 1000 to thousand
-		{"descend and maintain, 9 or 1000", []string{"descend", "and", "maintain", "9", "thousand"}},
-		// "fly heading" sometimes transcribed as "flighting"
-		{"flighting 030", []string{"fly", "heading", "030"}},
+		// "niner thousand" transcribed as "9 or 1000" passes through.
+		{"descend and maintain, 9 or 1000", []string{"descend", "and", "maintain", "9", "or", "1000"}},
+		// Garbled command words ("flighting" for "fly heading") pass
+		// through normalization untouched; they are recognized during
+		// template matching via the confusion table.
+		{"flighting 030", []string{"flighting", "030"}},
 		// "@" should be treated as "at"
 		{"@ cameron descend", []string{"at", "cameron", "descend"}},
 		// processAndDigit: single digits on both sides → "and" → "1" (mishearing of "one")
@@ -4056,32 +4128,6 @@ func TestDecodeCommandsForCallsign(t *testing.T) {
 // JSON File Tests from tests/ directory
 // =============================================================================
 
-// STTTestFile represents the JSON structure of test files in tests/ directory.
-// These files are logged by SimManager.ReportSTTLog and contain the full context
-// present when an STT command was processed.
-type STTTestFile struct {
-	Transcript  string `json:"transcript"`
-	Callsign    string `json:"callsign"`
-	Command     string `json:"command"` // Expected command output
-	STTAircraft map[string]struct {
-		Callsign                  string                       `json:"Callsign"`
-		AircraftType              string                       `json:"AircraftType"`
-		Fixes                     map[string]string            `json:"Fixes"`
-		CandidateApproaches       map[string]string            `json:"CandidateApproaches"`
-		CandidateVisualApproaches map[string]string            `json:"CandidateVisualApproaches"`
-		ApproachFixes             map[string]map[string]string `json:"ApproachFixes"`
-		AssignedApproach          string                       `json:"AssignedApproach"`
-		SID                       string                       `json:"SID"`
-		STAR                      string                       `json:"STAR"`
-		Altitude                  int                          `json:"Altitude"`
-		State                     string                       `json:"State"`
-		ControllerFrequency       string                       `json:"ControllerFrequency"`
-		TrackingController        string                       `json:"TrackingController"`
-		AddressingForm            int                          `json:"AddressingForm"`
-		LAHSORunways              []string                     `json:"LAHSORunways"`
-	} `json:"stt_aircraft"`
-}
-
 // TestSTTFromJSONFiles runs all JSON test files from the tests/ directory.
 // Each file contains a transcript, the full aircraft context, and the expected
 // command output. This allows regression testing with real-world scenarios.
@@ -4110,63 +4156,12 @@ func TestSTTFromJSONFiles(t *testing.T) {
 	for _, file := range files {
 		testName := strings.TrimSuffix(filepath.Base(file), ".json")
 		t.Run(testName, func(t *testing.T) {
-			// Read and parse the JSON file
-			data, err := os.ReadFile(file)
+			testFile, err := LoadTestFile(file)
 			if err != nil {
-				t.Fatalf("failed to read %s: %v", file, err)
+				t.Fatalf("failed to load %s: %v", file, err)
 			}
 
-			var testFile STTTestFile
-			if err := json.Unmarshal(data, &testFile); err != nil {
-				t.Fatalf("failed to parse %s: %v", file, err)
-			}
-
-			// Convert JSON aircraft to STT Aircraft map.
-			// Bake /T into the callsign for type-based addressing entries,
-			// mirroring the production context initialization in provider.go.
-			aircraft := make(map[string]Aircraft)
-			for key, ac := range testFile.STTAircraft {
-				callsign := ac.Callsign
-				form := sim.CallsignAddressingForm(ac.AddressingForm)
-				if form == sim.AddressingFormTypeTrailing3 && !strings.HasSuffix(callsign, "/T") {
-					callsign += "/T"
-				}
-				// Merge assigned approach fixes into the Fixes map, mirroring
-				// the production behavior in provider.go.
-				fixes := ac.Fixes
-				if ac.AssignedApproach != "" && len(ac.ApproachFixes) > 0 {
-					telephony := av.GetApproachTelephony(ac.AssignedApproach)
-					if code, ok := ac.CandidateApproaches[telephony]; ok {
-						if approachFixes, ok := ac.ApproachFixes[code]; ok {
-							if fixes == nil {
-								fixes = make(map[string]string)
-							}
-							for spoken, fix := range approachFixes {
-								if _, exists := fixes[spoken]; !exists {
-									fixes[spoken] = fix
-								}
-							}
-						}
-					}
-				}
-
-				aircraft[key] = Aircraft{
-					Callsign:                  callsign,
-					AircraftType:              ac.AircraftType,
-					Fixes:                     fixes,
-					CandidateApproaches:       ac.CandidateApproaches,
-					CandidateVisualApproaches: ac.CandidateVisualApproaches,
-					AssignedApproach:          ac.AssignedApproach,
-					SID:                       ac.SID,
-					STAR:                      ac.STAR,
-					Altitude:                  ac.Altitude,
-					State:                     ac.State,
-					ControllerFrequency:       ac.ControllerFrequency,
-					TrackingController:        ac.TrackingController,
-					AddressingForm:            form,
-					LAHSORunways:              ac.LAHSORunways,
-				}
-			}
+			aircraft := testFile.BuildAircraftMap()
 
 			// Run the transcript through STT
 			result, err := provider.DecodeTranscript(aircraft, testFile.Transcript, "")
@@ -4175,15 +4170,7 @@ func TestSTTFromJSONFiles(t *testing.T) {
 				return
 			}
 
-			// Build expected output: "CALLSIGN COMMANDS" or "" if both empty
-			var expected string
-			if testFile.Callsign == "" && testFile.Command == "" {
-				expected = ""
-			} else {
-				expected = strings.TrimSpace(testFile.Callsign + " " + testFile.Command)
-			}
-
-			if !CommandsEquivalent(expected, result, aircraft) {
+			if expected := testFile.Expected(); !CommandsEquivalent(expected, result, aircraft) {
 				t.Errorf("got %q, want %q", result, expected)
 			}
 		})
@@ -4654,5 +4641,47 @@ func TestNegativeWithoutCallsign(t *testing.T) {
 				t.Errorf("got %q, want %q", result, tt.expected)
 			}
 		})
+	}
+}
+
+// TestProceedDirectDistantFixes checks "direct <fix>" commands for fixes
+// anywhere along the route. (This is a regression test for NCT Area D, where
+// distance culling used to drop far-away exit fixes from the candidate map so
+// that e.g. "direct Susie" fuzzy-matched the nearby SSTIK instead of SUSEY.)
+func TestProceedDirectDistantFixes(t *testing.T) {
+	aircraft := map[string]Aircraft{
+		"Frontier flight forty four fifty five": {
+			Callsign: "FFT4455", Altitude: 4000, State: "departure", SID: "SSTIK1",
+			Fixes: map[string]string{
+				"San Francisco Intl": "KSFO",
+				"Stick":              "SSTIK",
+				"Lejay":              "LEJAY",
+				"candel":             "CNDEL",
+				"Port":               "PORTE",
+				"Foil":               "FFOIL",
+				"Susie":              "SUSEY",
+				"K-X":                "KAYEX",
+				"Intel":              "NTELL",
+			},
+		},
+	}
+
+	provider := NewTranscriber(nil)
+	for _, tt := range []struct {
+		transcript string
+		expected   string
+	}{
+		{"Frontier flight forty four fifty five cleared direct foil", "FFT4455 DFFOIL"},
+		{"Frontier flight forty four fifty five cleared direct intel", "FFT4455 DNTELL"},
+		// This one in particular must not match the similar-sounding SSTIK.
+		{"Frontier flight forty four fifty five proceed direct susie", "FFT4455 DSUSEY"},
+		{"Frontier flight forty four fifty five proceed direct k x", "FFT4455 DKAYEX"},
+	} {
+		result, err := provider.DecodeTranscript(aircraft, tt.transcript, "")
+		if err != nil {
+			t.Errorf("%q: unexpected error: %v", tt.transcript, err)
+		} else if result != tt.expected {
+			t.Errorf("%q: got %q, want %q", tt.transcript, result, tt.expected)
+		}
 	}
 }

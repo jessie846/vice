@@ -29,6 +29,7 @@ import (
 	"github.com/mmp/vice/wx"
 
 	"github.com/AllenDang/cimgui-go/imgui"
+	"github.com/brunoga/deep"
 )
 
 type NewSimConfiguration struct {
@@ -58,18 +59,21 @@ type NewSimConfiguration struct {
 	weatherFilter      wx.WeatherFilter
 	weatherFilterError string
 
-	// mu protects all fields written by the fetchMETAR goroutine and the
-	// inputs it reads back when committing: the cached METAR + atmospheric
-	// state below, plus c.weatherFilter / c.weatherFilterError / c.StartTime /
+	// mu protects all fields written by the fetchMETAR and fetchTrafficPreview
+	// goroutines and the inputs they read back when committing: the cached
+	// METAR + atmospheric state below, the traffic preview counts at the end,
+	// plus c.weatherFilter / c.weatherFilterError / c.StartTime /
 	// c.savedVFRDepartureRateScale, and the c.GroupName / c.ScenarioSpec /
 	// c.ScenarioName fields written by SetScenario. fetchSeq is incremented
 	// each time SetScenario launches a new fetch; a goroutine bails if its
-	// captured seq no longer matches.
+	// captured seq no longer matches, and the preview does the same with its
+	// pending key.
 	mu              util.LoggingMutex
 	fetchSeq        uint64
 	airportMETAR    map[string][]wx.METAR
 	metarAirports   []string
 	metarFacility   string
+	metarWidth      int // characters; see metarText
 	fetchMETARError error
 
 	// Winds aloft data for the current facility
@@ -80,6 +84,19 @@ type NewSimConfiguration struct {
 	availableWXIntervals []util.TimeInterval
 
 	savedVFRDepartureRateScale float32
+
+	// Traffic preview counts from the server, drawn under the traffic source
+	// radio buttons. trafficPreviewKey identifies the settings the counts in
+	// hand answer for and trafficPreviewPending the settings the request in
+	// flight asks about; at most one request is out at a time, so dragging the
+	// start time around coalesces to one round trip after another rather than a
+	// pile of them.
+	trafficPreviewKey        string
+	trafficPreviewPending    string
+	trafficPreviewDepartures []uint16
+	trafficPreviewArrivals   []uint16
+	trafficPreviewError      error
+	trafficPreviewRetryAt    time.Time
 }
 
 func MakeNewSimConfiguration(mgr *client.ConnectionManager, defaultFacility *string, lg *log.Logger) *NewSimConfiguration {
@@ -138,8 +155,10 @@ func (c *NewSimConfiguration) SetScenario(groupName, scenarioName string) {
 	c.GroupName = groupName
 	c.ScenarioSpec = spec
 	c.ScenarioName = scenarioName
+	normalizeTrafficSourceConfig(c.ScenarioSpec)
 	c.savedVFRDepartureRateScale = spec.LaunchConfig.VFRDepartureRateScale
 	c.initDefaultWindDirection()
+	c.clearTrafficPreviewLocked()
 	c.fetchSeq++
 	seq := c.fetchSeq
 	if c.metarFacility != facility || !slices.Equal(c.metarAirports, airports) {
@@ -148,6 +167,487 @@ func (c *NewSimConfiguration) SetScenario(groupName, scenarioName string) {
 	c.mu.Unlock(c.lg)
 
 	go c.fetchMETAR(seq, facility, airports, spec)
+}
+
+func normalizeTrafficSourceConfig(spec *server.ScenarioSpec) {
+	lc := &spec.LaunchConfig
+	lc.TimetableStartMinute = min(max(lc.TimetableStartMinute, 0), 24*60-1)
+	lc.PublishedArrivalPercentage = min(max(lc.PublishedArrivalPercentage, 0), 100)
+	lc.PublishedDeparturePercentage = min(max(lc.PublishedDeparturePercentage, 0), 100)
+
+	// The server decides which sources a scenario can be flown with; fall back
+	// to the first it offers rather than one it would refuse.
+	if !slices.Contains(spec.TrafficSources, lc.TrafficSource) && len(spec.TrafficSources) > 0 {
+		lc.TrafficSource = spec.TrafficSources[0]
+	}
+
+	if len(spec.Timetables) == 0 {
+		lc.TimetableID = ""
+		return
+	}
+
+	for _, timetable := range spec.Timetables {
+		if timetable.ID == lc.TimetableID {
+			return
+		}
+	}
+	lc.TimetableID = spec.Timetables[0].ID
+}
+
+func selectedTimetableSummary(spec *server.ScenarioSpec) (sim.TimetableSummary, bool) {
+	for _, timetable := range spec.Timetables {
+		if timetable.ID == spec.LaunchConfig.TimetableID {
+			return timetable, true
+		}
+	}
+	return sim.TimetableSummary{}, false
+}
+
+// timetableStartMinute is the sim start time as a local clock time at the
+// timetable's airport, which is how a timetable's own times are expressed. The
+// start time is chosen once, above; a timetable just needs it in local terms.
+func timetableStartMinute(start time.Time, airport string) (int, error) {
+	location, ok := av.DB.AirportTimeZones[airport]
+	if !ok {
+		return 0, fmt.Errorf("no time zone is known for %s", airport)
+	}
+	local := start.In(location)
+	return local.Hour()*60 + local.Minute(), nil
+}
+
+func (c *NewSimConfiguration) trafficSourceTooltip(source sim.TrafficSource, spec *server.ScenarioSpec) string {
+	switch source {
+	case sim.TrafficSourceScenario:
+		return "Traffic generated from the scenario's own definitions, at the arrival\n" +
+			"and departure rates you set."
+	case sim.TrafficSourceTimetable:
+		return "Fly a curated daily timetable for " + spec.PrimaryAirport + ", starting at the\n" +
+			"selected time. Overflights remain randomly generated."
+	case sim.TrafficSourceHistorical:
+		return "Fly the traffic that really operated at " + c.NewSimRequest.Facility +
+			" on the selected date,\nfrom recorded flight data."
+	default:
+		return ""
+	}
+}
+
+func (c *NewSimConfiguration) drawTrafficSourceUI(spec *server.ScenarioSpec, p platform.Platform) {
+	lc := &spec.LaunchConfig
+
+	// Only the sources the server says it will run this scenario with are
+	// offered: a scenario that gives no airlines has no traffic of its own to
+	// generate, and most facilities have no timetable.
+	imgui.Text("IFR traffic source:")
+	for _, source := range spec.TrafficSources {
+		imgui.SameLine()
+		if len(spec.TrafficSources) == 1 {
+			imgui.Text(source.String())
+		} else {
+			imgui.RadioButtonIntPtr(source.String(), (*int32)(&lc.TrafficSource), int32(source))
+		}
+		if imgui.IsItemHovered() {
+			imgui.SetTooltip(c.trafficSourceTooltip(source, spec))
+		}
+	}
+
+	normalizeTrafficSourceConfig(spec)
+
+	if lc.TrafficSource == sim.TrafficSourceTimetable {
+		selected, _ := selectedTimetableSummary(spec)
+
+		imgui.Text("Timetable:")
+		imgui.SameLine()
+		imgui.SetNextItemWidth(260)
+		if imgui.BeginCombo("##timetable", selected.Name) {
+			for _, timetable := range spec.Timetables {
+				isSelected := timetable.ID == lc.TimetableID
+				if imgui.SelectableBoolV(timetable.Name, isSelected, 0, imgui.Vec2{}) {
+					lc.TimetableID = timetable.ID
+					selected = timetable
+				}
+				if isSelected {
+					imgui.SetItemDefaultFocus()
+				}
+			}
+			imgui.EndCombo()
+		}
+	}
+
+	// Scenario traffic comes at the rates set below, which the Departures and
+	// Arrivals headers already total; only published traffic has a shape worth
+	// plotting.
+	if lc.TrafficSource != sim.TrafficSourceScenario {
+		c.drawTrafficPlot(spec, p)
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Traffic preview plot
+
+const (
+	trafficPlotWidth  = 560
+	trafficPlotHeight = 80
+
+	// trafficPlotBandwidth is the standard deviation, in minutes, of the
+	// Gaussian the per-minute operation counts are smoothed with. Operations
+	// come in clumps, so the raw counts are nothing but spikes; a few minutes of
+	// smoothing turns them into the rate a controller would feel.
+	trafficPlotBandwidth = 6
+
+	// trafficPlotRateStep is what the vertical axis rounds up to. Rounding
+	// coarsely keeps the scale still as the start time moves, so that two times
+	// can be compared by eye rather than by reading the axis each time.
+	trafficPlotRateStep = 20
+
+	// trafficPlotLookahead is how far ahead of the minute under the cursor the
+	// tooltip counts the traffic, answering what the rate under it can't: how
+	// many aircraft actually turn up if the sim starts there.
+	trafficPlotLookahead = 15
+
+	// trafficPreviewRetryDelay is how long a failed preview request stands as
+	// the answer for its settings before they are asked about again. A remote
+	// server's failure may be a passing one--a network blip, a restart--and
+	// asking again is how the plot comes back.
+	trafficPreviewRetryDelay = 5 * time.Second
+)
+
+var (
+	trafficPlotDepartureColor  = imgui.Vec4{.36, .66, .38, 1}
+	trafficPlotArrivalColor    = imgui.Vec4{.44, .61, .85, 1}
+	trafficPlotOverflightColor = imgui.Vec4{.85, .68, .36, 1}
+)
+
+// drawTrafficPlot draws how much traffic the selected start time brings over
+// the following two hours: departures, arrivals, and overflights stacked, with
+// the local clock along the bottom. Only published traffic has a shape to plot,
+// and the counts behind it come from the server, which is the one with the
+// flight data and the one that will fly it.
+func (c *NewSimConfiguration) drawTrafficPlot(spec *server.ScenarioSpec, p platform.Platform) {
+	c.updateTrafficPreview(spec)
+
+	if c.trafficPreviewError != nil {
+		imgui.PushStyleColorVec4(imgui.ColText, imgui.Vec4{1, .5, .5, 1})
+		imgui.Text(renderer.FontAwesomeIconExclamationTriangle + " " + c.trafficPreviewError.Error())
+		imgui.PopStyleColor()
+		return
+	}
+	// The preview reaches past both ends of the window so that the smoothing has
+	// something to work with at the edges; only the window itself is drawn.
+	pad := int(sim.TrafficCountsPad / time.Minute)
+	window := int(sim.TrafficCountsWindow / time.Minute)
+	if len(c.trafficPreviewDepartures) < pad+window || len(c.trafficPreviewArrivals) < pad+window {
+		imgui.Text("Estimating traffic...")
+		return
+	}
+	departures := smoothTrafficCounts(c.trafficPreviewDepartures)[pad : pad+window]
+	arrivals := smoothTrafficCounts(c.trafficPreviewArrivals)[pad : pad+window]
+
+	// No traffic source publishes overflights--they are generated at the
+	// scenario's rate whatever the source--so their band is flat.
+	overflightRate := spec.LaunchConfig.WorkedOverflightRate()
+	overflights := make([]float32, window)
+	for i := range overflights {
+		overflights[i] = overflightRate
+	}
+
+	series := [3][]float32{departures, arrivals, overflights}
+	colors := [3]imgui.Vec4{trafficPlotDepartureColor, trafficPlotArrivalColor, trafficPlotOverflightColor}
+
+	// Round the peak up so the axis holds still as the start time moves.
+	var peak float32
+	for i := range window {
+		peak = max(peak, departures[i]+arrivals[i]+overflightRate)
+	}
+	maxRate := trafficPlotRateStep * math.Ceil(peak/trafficPlotRateStep)
+	maxRate = max(maxRate, trafficPlotRateStep)
+
+	imgui.BeginGroup()
+	imgui.Text("Next 2 hours:")
+	drawTrafficPlotLegend(trafficPlotDepartureColor, "departures", sumTrafficCounts(c.trafficPreviewDepartures, pad, window))
+	drawTrafficPlotLegend(trafficPlotArrivalColor, "arrivals", sumTrafficCounts(c.trafficPreviewArrivals, pad, window))
+	drawTrafficPlotLegend(trafficPlotOverflightColor, "overflights", int(overflightRate*2+.5))
+	imgui.EndGroup()
+	imgui.SameLine()
+
+	scale := util.Select(runtime.GOOS == "windows", p.DPIScale(), float32(1))
+	size := imgui.Vec2{X: scale * trafficPlotWidth, Y: scale * trafficPlotHeight}
+	p0 := imgui.CursorScreenPos()
+	p1 := imgui.Vec2{X: p0.X + size.X, Y: p0.Y + size.Y}
+
+	x := func(minute int) float32 { return p0.X + size.X*float32(minute)/float32(window-1) }
+	y := func(rate float32) float32 { return p1.Y - size.Y*min(rate/maxRate, 1) }
+
+	drawList := imgui.WindowDrawList()
+	drawList.AddRectFilled(p0, p1, imgui.ColorU32Vec4(imgui.Vec4{.1, .1, .12, 1}))
+
+	// levels[0] is the bottom of the stack and each band raises it by its own
+	// rates, so a band fills between levels[band] and levels[band+1] and the
+	// last level is the total.
+	levels := make([][]float32, len(series)+1)
+	levels[0] = make([]float32, window)
+	for band, rates := range series {
+		levels[band+1] = make([]float32, window)
+		for i, rate := range rates {
+			levels[band+1][i] = levels[band][i] + rate
+		}
+	}
+
+	// The fills are a quad per minute, which anti-aliasing would leave a seam
+	// between; the outlines drawn after them do want it.
+	const aaFlags = imgui.DrawListFlagsAntiAliasedLines | imgui.DrawListFlagsAntiAliasedFill
+	prevFlags := drawList.Flags()
+	drawList.SetFlags(prevFlags &^ aaFlags)
+	for band, color := range colors {
+		color.W = .8
+		fillColor := imgui.ColorU32Vec4(color)
+		bottom, top := levels[band], levels[band+1]
+		for i := range window - 1 {
+			drawList.AddQuadFilled(imgui.Vec2{X: x(i), Y: y(bottom[i])},
+				imgui.Vec2{X: x(i + 1), Y: y(bottom[i+1])},
+				imgui.Vec2{X: x(i + 1), Y: y(top[i+1])},
+				imgui.Vec2{X: x(i), Y: y(top[i])}, fillColor)
+		}
+	}
+	drawList.SetFlags(prevFlags)
+
+	outline := make([]imgui.Vec2, window)
+	for band, color := range colors {
+		for i, top := range levels[band+1] {
+			outline[i] = imgui.Vec2{X: x(i), Y: y(top)}
+		}
+		drawList.AddPolyline(&outline[0], int32(window), imgui.ColorU32Vec4(color), 0, scale)
+	}
+
+	c.drawTrafficPlotAxes(drawList, spec, p0, p1, size, window, maxRate)
+	drawList.AddRect(p0, p1, imgui.ColorU32Vec4(imgui.Vec4{.4, .4, .4, 1}))
+
+	imgui.Dummy(size)
+
+	if imgui.IsItemHovered() {
+		minute := int(math.Clamp((imgui.MousePos().X-p0.X)/size.X*float32(window-1), 0, float32(window-1)))
+		cursor := x(minute)
+		drawList.AddLine(imgui.Vec2{X: cursor, Y: p0.Y}, imgui.Vec2{X: cursor, Y: p1.Y},
+			imgui.ColorU32Vec4(imgui.Vec4{1, 1, 1, .6}))
+		// The curve is a rate: what the traffic around this minute comes to per
+		// hour, not a count of what follows it. Give the count over the next
+		// quarter hour too, since that is the other thing worth knowing about a
+		// time and reading it off a rate is guesswork.
+		imgui.SetTooltip(fmt.Sprintf("%s\nrate: %d dep, %d arr, %d ovf per hour\n"+
+			"next %d min: %d dep, %d arr, %d ovf",
+			c.trafficPlotTime(spec, minute), int(departures[minute]+.5), int(arrivals[minute]+.5),
+			int(overflightRate+.5), trafficPlotLookahead,
+			sumTrafficCounts(c.trafficPreviewDepartures, pad+minute, trafficPlotLookahead),
+			sumTrafficCounts(c.trafficPreviewArrivals, pad+minute, trafficPlotLookahead),
+			int(overflightRate*trafficPlotLookahead/60+.5)))
+	}
+}
+
+// drawTrafficPlotAxes draws the half-hour gridlines with the local clock time at
+// each, and marks the top of the vertical axis with the rate it stands for.
+func (c *NewSimConfiguration) drawTrafficPlotAxes(drawList *imgui.DrawList, spec *server.ScenarioSpec,
+	p0, p1, size imgui.Vec2, window int, maxRate float32) {
+	gridColor := imgui.ColorU32Vec4(imgui.Vec4{1, 1, 1, .25})
+	labelColor := imgui.ColorU32Vec4(imgui.Vec4{1, 1, 1, .5})
+
+	start := c.NewSimRequest.StartTime.Truncate(time.Minute)
+	location, _ := trafficPlotLocation(spec.PrimaryAirport)
+	for minute := range window {
+		t := start.Add(time.Duration(minute) * time.Minute).In(location)
+		if t.Minute()%30 != 0 {
+			continue
+		}
+		x := p0.X + size.X*float32(minute)/float32(window-1)
+		drawList.AddLine(imgui.Vec2{X: x, Y: p0.Y}, imgui.Vec2{X: x, Y: p1.Y}, gridColor)
+
+		label := t.Format("15:04")
+		if width := imgui.CalcTextSize(label).X; x+2+width < p1.X {
+			drawList.AddTextVec2(imgui.Vec2{X: x + 2, Y: p1.Y - imgui.TextLineHeight()}, labelColor, label)
+		}
+	}
+
+	// The horizontal rule is the top of the axis, so the label goes just below it.
+	drawList.AddLine(imgui.Vec2{X: p0.X, Y: p0.Y}, imgui.Vec2{X: p1.X, Y: p0.Y}, gridColor)
+	label := fmt.Sprintf("%d/hr", int(maxRate))
+	drawList.AddTextVec2(imgui.Vec2{X: p1.X - imgui.CalcTextSize(label).X - 3, Y: p0.Y + 1}, labelColor, label)
+}
+
+// trafficPlotLocation is the time zone the plot's clock times are given in: the
+// airport's, which is how a controller working it thinks about the clock. Zulu
+// stands in for an airport with no time zone on file, and says so.
+func trafficPlotLocation(airport string) (*time.Location, bool) {
+	if location, ok := av.DB.AirportTimeZones[airport]; ok {
+		return location, true
+	}
+	return time.UTC, false
+}
+
+func (c *NewSimConfiguration) trafficPlotTime(spec *server.ScenarioSpec, minute int) string {
+	t := c.NewSimRequest.StartTime.Truncate(time.Minute).Add(time.Duration(minute) * time.Minute)
+	location, local := trafficPlotLocation(spec.PrimaryAirport)
+	return t.In(location).Format(util.Select(local, "15:04 local", "15:04Z"))
+}
+
+func drawTrafficPlotLegend(color imgui.Vec4, label string, count int) {
+	imgui.PushStyleColorVec4(imgui.ColText, color)
+	imgui.Text(fmt.Sprintf("%3d %s", count, label))
+	imgui.PopStyleColor()
+}
+
+// sumTrafficCounts counts the operations over n minutes from offset, stopping
+// at the end of what the server sent rather than running off it.
+func sumTrafficCounts(counts []uint16, offset, n int) int {
+	total := 0
+	for _, count := range counts[offset:min(offset+n, len(counts))] {
+		total += int(count)
+	}
+	return total
+}
+
+// smoothTrafficCounts turns per-minute operation counts into the rate at each
+// minute, in operations per hour. The Gaussian is centered, so a minute's value
+// describes the traffic around it--the half hour it sits in the middle of,
+// weighted towards the minute itself--rather than the traffic that follows it.
+// It is a rate and not a count: how much traffic an hour it would come to if it
+// carried on at the density it has there, which is the sense in which a
+// controller's ADR and AAR are per hour too.
+func smoothTrafficCounts(counts []uint16) []float32 {
+	// Truncate the Gaussian at three standard deviations; past that it
+	// contributes under half a percent and only costs time.
+	radius := 3 * trafficPlotBandwidth
+	kernel := make([]float32, 2*radius+1)
+	var kernelSum float32
+	for i := range kernel {
+		x := float32(i-radius) / trafficPlotBandwidth
+		kernel[i] = math.FastExp(-.5 * x * x)
+		kernelSum += kernel[i]
+	}
+
+	rates := make([]float32, len(counts))
+	for i := range counts {
+		var rate float32
+		for j, weight := range kernel {
+			if k := i + j - radius; k >= 0 && k < len(counts) {
+				rate += weight * float32(counts[k])
+			}
+		}
+		// One aircraft a minute is sixty an hour, which is how much traffic is
+		// always talked about.
+		rates[i] = 60 * rate / kernelSum
+	}
+	return rates
+}
+
+// updateTrafficPreview asks the server how much traffic the current settings
+// would fly, if what came back last time doesn't already answer for them. Only
+// one request is in flight at a time: dragging the start time around would
+// otherwise put out a request a frame, and the answers are only worth having in
+// the order they were asked for anyway. A failed answer stands only until
+// trafficPreviewRetryAt, so a passing failure doesn't leave the error up for
+// good.
+func (c *NewSimConfiguration) updateTrafficPreview(spec *server.ScenarioSpec) {
+	if c.trafficPreviewPending != "" {
+		return
+	}
+	key := trafficPreviewKey(&c.NewSimRequest, spec)
+	if key == c.trafficPreviewKey &&
+		(c.trafficPreviewError == nil || time.Now().Before(c.trafficPreviewRetryAt)) {
+		return
+	}
+
+	// The launch config's maps are the dialog's, which the user goes on editing
+	// while the request is in flight; the request needs its own copy.
+	args := &server.TrafficCountsArgs{
+		Facility:     c.Facility,
+		GroupName:    c.GroupName,
+		ScenarioName: c.ScenarioName,
+		StartTime:    c.NewSimRequest.StartTime,
+		LaunchConfig: deep.MustCopy(spec.LaunchConfig),
+	}
+	if spec.LaunchConfig.TrafficSource == sim.TrafficSourceTimetable {
+		// Where a timetable's day starts, worked out the same way Start() works
+		// it out, so that the preview and the sim it previews agree.
+		minutes, err := timetableStartMinute(c.NewSimRequest.StartTime, spec.PrimaryAirport)
+		if err != nil {
+			c.trafficPreviewKey, c.trafficPreviewError = key, err
+			c.trafficPreviewRetryAt = time.Now().Add(trafficPreviewRetryDelay)
+			return
+		}
+		args.LaunchConfig.TimetableStartMinute = minutes
+	}
+
+	c.trafficPreviewPending = key
+	go c.fetchTrafficPreview(c.selectedServer, key, args)
+}
+
+// fetchTrafficPreview runs in its own goroutine. Like fetchMETAR, its inputs
+// come in by parameter--the server among them, which the UI thread reassigns
+// when the user switches between a local and a remote sim--so that it reads
+// nothing off the UI thread while the slow call is in flight.
+func (c *NewSimConfiguration) fetchTrafficPreview(srv *client.Server, key string,
+	args *server.TrafficCountsArgs) {
+	var result server.TrafficCountsResult
+	err := srv.CallWithTimeout(server.GetTrafficCountsRPC, args, &result)
+
+	c.mu.Lock(c.lg)
+	defer c.mu.Unlock(c.lg)
+
+	// The scenario may have changed while the request was out, in which case
+	// this answer is for a scenario no longer on screen; drawing it would be
+	// worse than drawing nothing. The draw path asks again.
+	if c.trafficPreviewPending != key {
+		return
+	}
+
+	c.trafficPreviewKey = key
+	c.trafficPreviewPending = ""
+	c.trafficPreviewDepartures, c.trafficPreviewArrivals = result.Departures, result.Arrivals
+	c.trafficPreviewError = err
+	if err != nil {
+		c.trafficPreviewRetryAt = time.Now().Add(trafficPreviewRetryDelay)
+	}
+}
+
+// trafficPreviewKey gathers everything the server's answer depends on, so that
+// the preview is asked for again exactly when one of them changes. Start times
+// are keyed to the minute since that is as fine as the counts go.
+func trafficPreviewKey(req *server.NewSimRequest, spec *server.ScenarioSpec) string {
+	lc := &spec.LaunchConfig
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s/%s/%s %s %s %s %d%% %d%%", req.Facility, req.GroupName, req.ScenarioName,
+		req.StartTime.UTC().Format("2006-01-02T15:04"), lc.TrafficSource, lc.TimetableID,
+		lc.PublishedArrivalPercentage, lc.PublishedDeparturePercentage)
+
+	// Which flows are on decides what flies, so it decides the counts as well.
+	for airport, runways := range util.SortedMap(lc.DepartureEnabled) {
+		for runway, categories := range util.SortedMap(runways) {
+			for category, enabled := range util.SortedMap(categories) {
+				if enabled {
+					fmt.Fprintf(&b, " D%s/%s/%s", airport, runway, category)
+				}
+			}
+		}
+	}
+	for group, airports := range util.SortedMap(lc.InboundFlowEnabled) {
+		for airport, enabled := range util.SortedMap(airports) {
+			if enabled {
+				fmt.Fprintf(&b, " A%s/%s", group, airport)
+			}
+		}
+	}
+	return b.String()
+}
+
+// clearTrafficPreviewLocked drops the counts in hand, for when the scenario they
+// were for is no longer the one on screen. Clearing the pending key abandons a
+// request that is still out: its answer is for the old scenario too.
+func (c *NewSimConfiguration) clearTrafficPreviewLocked() {
+	c.trafficPreviewKey = ""
+	c.trafficPreviewPending = ""
+	c.trafficPreviewDepartures = nil
+	c.trafficPreviewArrivals = nil
+	c.trafficPreviewError = nil
+	c.trafficPreviewRetryAt = time.Time{}
 }
 
 // initDefaultWindDirection computes the default wind direction range from the scenario's runways.
@@ -241,6 +741,12 @@ func (c *NewSimConfiguration) fetchMETAR(seq uint64, facility string, airports [
 	c.fetchMETARError = metarErr
 	c.metarAirports = airports
 	c.metarFacility = facility
+	c.metarWidth = 0
+	for _, ms := range metars {
+		for _, m := range ms {
+			c.metarWidth = max(c.metarWidth, len(metarObservation(m)))
+		}
+	}
 	c.atmosByTime = atmosByTime
 	c.isTRACON = isTRACON
 	c.windsAloftAltitudes = windsAloftAltitudes
@@ -254,10 +760,25 @@ func (c *NewSimConfiguration) fetchMETAR(seq uint64, facility string, airports [
 	c.updateStartTimeForRunways(spec)
 }
 
+// metarObservation is the observation as it is shown in the configuration
+// window: without its report type and without the remarks.
+func metarObservation(m wx.METAR) string {
+	return strings.TrimPrefix(strings.TrimPrefix(m.Observation(), "METAR "), "SPECI ")
+}
+
+// metarText pads the observation out to the width of the longest one on hand.
+// The METAR is drawn in a fixed-width font and is the widest thing in the
+// window, so without this the window resizes under the cursor as the start time
+// is scrubbed from one observation to the next.
+func (c *NewSimConfiguration) metarText(m wx.METAR) string {
+	return fmt.Sprintf("%-*s", c.metarWidth, metarObservation(m))
+}
+
 func (c *NewSimConfiguration) clearWeatherLocked() {
 	c.airportMETAR = nil
 	c.metarAirports = nil
 	c.metarFacility = ""
+	c.metarWidth = 0
 	c.fetchMETARError = nil
 	c.atmosByTime = nil
 	c.isTRACON = false
@@ -1257,7 +1778,23 @@ func (c *NewSimConfiguration) DrawConfigurationUI(p platform.Platform, config *C
 	// SIMULATION SETTINGS section
 	drawSectionHeader("Simulation Settings")
 
+	// A published flight's callsign is the one it really used, so a clash can't
+	// be settled by drawing another: the flight would be thrown away instead.
+	// Only the scenario's own generator can resample, so the setting is offered
+	// only there.
+	publishedTraffic := c.ScenarioSpec != nil &&
+		c.ScenarioSpec.LaunchConfig.TrafficSource != sim.TrafficSourceScenario
+	if publishedTraffic {
+		imgui.BeginDisabled()
+		c.NewSimRequest.EnforceUniqueCallsignSuffix = false
+	}
 	imgui.Checkbox("Ensure unique callsign suffixes", &c.NewSimRequest.EnforceUniqueCallsignSuffix)
+	if publishedTraffic {
+		imgui.EndDisabled()
+		imgui.SameLine()
+		imgui.Text("(" + c.ScenarioSpec.LaunchConfig.TrafficSource.String() +
+			" traffic flies the callsigns it really used)")
+	}
 
 	imgui.Text("Readback error interval:")
 	imgui.SameLine()
@@ -1281,6 +1818,11 @@ func (c *NewSimConfiguration) DrawConfigurationUI(p platform.Platform, config *C
 	}
 	imgui.Spacing()
 
+	// TRAFFIC SOURCE section
+	drawSectionHeader("Traffic Source")
+	c.drawTrafficSourceUI(c.ScenarioSpec, p)
+	imgui.Spacing()
+
 	// TRAFFIC RATES section
 	drawSectionHeader("Traffic Rates")
 
@@ -1293,18 +1835,38 @@ func (c *NewSimConfiguration) DrawConfigurationUI(p platform.Platform, config *C
 		imgui.PopStyleColor()
 	}
 
-	// Departures (collapsible)
+	// Published IFR traffic or the scenario's own rate controls; drawDepartureUI
+	// and drawArrivalUI show the appropriate controls for the traffic source.
+	// The rate-derived totals mean nothing when the data decides the traffic, so
+	// leave them out of the headers then. The totals are of the traffic the user
+	// will work: a scenario that flies a neighboring airport's operations for
+	// realism isn't offering them to anybody.
 	lc := &c.ScenarioSpec.LaunchConfig
 	if lc.HaveDepartures() {
-		depRate := lc.TotalDepartureRate()
-		headerText := fmt.Sprintf("Departures (Total: %d/hr)###departures", int(depRate+0.5))
+		headerText := "Departures###departures"
+		if lc.TrafficSource == sim.TrafficSourceScenario {
+			headerText = fmt.Sprintf("Departures (Total: %d/hr)###departures",
+				int(lc.WorkedDepartureRate()+0.5))
+		}
 		if imgui.CollapsingHeaderBoolPtr(headerText, nil) {
 			drawDepartureUI(lc, p)
 			imgui.Spacing()
 		}
 	}
 
-	// VFR Departures (collapsible)
+	if lc.HaveArrivals() {
+		headerText := "Arrivals###arrivals"
+		if lc.TrafficSource == sim.TrafficSourceScenario {
+			headerText = fmt.Sprintf("Arrivals (Total: %d/hr)###arrivals",
+				int(lc.WorkedArrivalRate()+0.5))
+		}
+		if imgui.CollapsingHeaderBoolPtr(headerText, nil) {
+			drawArrivalUI(lc, p)
+			imgui.Spacing()
+		}
+	}
+
+	// VFR Departures remain independent of the IFR traffic source.
 	if len(lc.VFRAirportRates) > 0 {
 		var vfrRate float32
 		for _, rate := range lc.VFRAirportRates {
@@ -1313,26 +1875,19 @@ func (c *NewSimConfiguration) DrawConfigurationUI(p platform.Platform, config *C
 				vfrRate += r
 			}
 		}
-		headerText := fmt.Sprintf("VFR Departures (%d/hr)###vfrdepartures", int(vfrRate+0.5))
+		headerText := fmt.Sprintf(
+			"VFR Departures (%d/hr)###vfrdepartures",
+			int(vfrRate+0.5),
+		)
 		if imgui.CollapsingHeaderBoolPtr(headerText, nil) {
 			drawVFRDepartureUI(lc, p)
 			imgui.Spacing()
 		}
 	}
 
-	// Arrivals (collapsible)
-	if lc.HaveArrivals() {
-		arrRate := lc.TotalArrivalRate()
-		headerText := fmt.Sprintf("Arrivals (Total: %d/hr)###arrivals", int(arrRate+0.5))
-		if imgui.CollapsingHeaderBoolPtr(headerText, nil) {
-			drawArrivalUI(lc, p)
-			imgui.Spacing()
-		}
-	}
-
 	// Overflights (collapsible)
 	if lc.HaveOverflights() {
-		ofRate := lc.TotalOverflightRate()
+		ofRate := lc.WorkedOverflightRate()
 		headerText := fmt.Sprintf("Overflights (%d/hr)###overflights", int(ofRate+0.5))
 		if imgui.CollapsingHeaderBoolPtr(headerText, nil) {
 			drawOverflightUI(lc, p)
@@ -1351,32 +1906,16 @@ func (c *NewSimConfiguration) DrawConfigurationUI(p platform.Platform, config *C
 	return false
 }
 
-func (c *NewSimConfiguration) DrawRatesUI(p platform.Platform) bool {
-	// Check rate limits and clamp if necessary
-	const rateLimit = 100.0
-	rateClamped := false
-	if !c.ScenarioSpec.LaunchConfig.CheckRateLimits(rateLimit) {
-		c.ScenarioSpec.LaunchConfig.ClampRates(rateLimit)
-		rateClamped = true
-	}
-
-	// Display error message if rates were clamped
-	if rateClamped {
-		imgui.PushStyleColorVec4(imgui.ColText, imgui.Vec4{1, .5, .5, 1})
-		imgui.Text(fmt.Sprintf("Launch rates will be reduced to stay within the %d aircraft/hour limit", int(rateLimit)))
-		imgui.PopStyleColor()
-	}
-
-	drawDepartureUI(&c.ScenarioSpec.LaunchConfig, p)
-	drawVFRDepartureUI(&c.ScenarioSpec.LaunchConfig, p)
-	drawArrivalUI(&c.ScenarioSpec.LaunchConfig, p)
-	drawOverflightUI(&c.ScenarioSpec.LaunchConfig, p)
-	drawEmergencyAircraftUI(&c.ScenarioSpec.LaunchConfig, p)
-	return false
-}
-
 func (c *NewSimConfiguration) Start(config *Config) error {
 	c.ScenarioSpec.LaunchConfig.EnableTowerGoArounds = config.EnableTowerGoArounds
+
+	if c.ScenarioSpec.LaunchConfig.TrafficSource == sim.TrafficSourceTimetable {
+		minutes, err := timetableStartMinute(c.NewSimRequest.StartTime, c.ScenarioSpec.PrimaryAirport)
+		if err != nil {
+			return err
+		}
+		c.ScenarioSpec.LaunchConfig.TimetableStartMinute = minutes
+	}
 
 	if c.newSimType == NewSimJoinRemote {
 		// Set the privileged flag from the main config
@@ -1411,7 +1950,178 @@ func (c *NewSimConfiguration) Start(config *Config) error {
 	return nil
 }
 
+// drawPublishedDepartureUI and drawPublishedArrivalUI stand in for the rate
+// controls when the sim is flying historical or timetable traffic: how much
+// there is and where it goes comes from the data, so what is left to choose is
+// how much of it to fly and which flows are active.
+func drawPublishedDepartureUI(lc *sim.LaunchConfig, p platform.Platform) (changed bool) {
+	label := util.Select(lc.TrafficSource == sim.TrafficSourceHistorical,
+		"Percentage of historical departures", "Percentage of timetable departures")
+	value := int32(lc.PublishedDeparturePercentage)
+	imgui.SetNextItemWidth(260)
+	if imgui.SliderInt(label, &value, 0, 100) {
+		lc.PublishedDeparturePercentage = int(value)
+		changed = true
+	}
+
+	airportDepartures := make(map[string]int) // key is e.g. KJFK, then count of runways cross categories.
+	for ap, runwayEnabled := range lc.DepartureEnabled {
+		for _, categories := range runwayEnabled {
+			airportDepartures[ap] = airportDepartures[ap] + len(categories)
+		}
+	}
+	maxDepartureCategories := 0
+	for _, n := range airportDepartures {
+		maxDepartureCategories = max(n, maxDepartureCategories)
+	}
+	if maxDepartureCategories == 0 {
+		return
+	}
+
+	flags := imgui.TableFlagsBordersV | imgui.TableFlagsBordersOuterH | imgui.TableFlagsRowBg | imgui.TableFlagsSizingStretchProp
+	adrColumns := min(3, maxDepartureCategories)
+	tableScale := util.Select(runtime.GOOS == "windows", p.DPIScale(), float32(1))
+	if imgui.BeginTableV("departureRunways", int32(1+3*adrColumns), flags, imgui.Vec2{tableScale * float32(200+250*adrColumns), 0}, 0.) {
+		imgui.TableSetupColumn("Airport")
+		for range adrColumns {
+			imgui.TableSetupColumn("Runway")
+			imgui.TableSetupColumn("Category")
+			imgui.TableSetupColumn("Active")
+		}
+		imgui.TableHeadersRow()
+
+		for airport := range util.SortedMap(lc.DepartureEnabled) {
+			imgui.TableNextRow()
+			imgui.TableNextColumn()
+			imgui.Text(airport)
+
+			imgui.PushIDStr(airport)
+			adrColumn := 0
+			for runway := range util.SortedMap(lc.DepartureEnabled[airport]) {
+				imgui.PushIDStr(string(runway))
+
+				for category := range util.SortedMap(lc.DepartureEnabled[airport][runway]) {
+					imgui.TableNextColumn()
+					imgui.Text(runway.Base()) // don't include extras in the UI
+					imgui.TableNextColumn()
+
+					imgui.PushIDStr(category)
+
+					if category == "" {
+						imgui.Text("(All)")
+					} else {
+						imgui.Text(category)
+					}
+					imgui.TableNextColumn()
+
+					enabled := lc.DepartureEnabled[airport][runway][category]
+					if imgui.Checkbox("##enabled", &enabled) {
+						lc.DepartureEnabled[airport][runway][category] = enabled
+						changed = true
+					}
+
+					adrColumn++
+
+					if adrColumn < airportDepartures[airport] && adrColumn%adrColumns == 0 {
+						// Overflow
+						imgui.TableNextRow()
+						imgui.TableNextColumn()
+					}
+
+					imgui.PopID()
+				}
+				imgui.PopID()
+			}
+			imgui.PopID()
+		}
+		imgui.EndTable()
+	}
+
+	imgui.Separator()
+
+	return
+}
+
+func drawPublishedArrivalUI(lc *sim.LaunchConfig, p platform.Platform) (changed bool) {
+	label := util.Select(lc.TrafficSource == sim.TrafficSourceHistorical,
+		"Percentage of historical arrivals", "Percentage of timetable arrivals")
+	value := int32(lc.PublishedArrivalPercentage)
+	imgui.SetNextItemWidth(260)
+	if imgui.SliderInt(label, &value, 0, 100) {
+		lc.PublishedArrivalPercentage = int(value)
+		changed = true
+	}
+
+	// Go-arounds still apply; the arrival pushes don't, since when aircraft
+	// show up is what the data says.
+	changed = imgui.SliderFloatV("Go around probability", &lc.GoAroundRate, 0, 1, "%.02f", 0) || changed
+
+	numAirportFlows := make(map[string]int)
+	for _, groupEnabled := range lc.InboundFlowEnabled {
+		for ap := range groupEnabled {
+			numAirportFlows[ap] = numAirportFlows[ap] + 1
+		}
+	}
+	if len(numAirportFlows) == 0 { // no arrivals
+		return
+	}
+	maxAirportFlows := 0
+	for _, n := range numAirportFlows {
+		maxAirportFlows = max(n, maxAirportFlows)
+	}
+
+	aarColumns := min(3, maxAirportFlows)
+	flags := imgui.TableFlagsBordersV | imgui.TableFlagsBordersOuterH | imgui.TableFlagsRowBg | imgui.TableFlagsSizingStretchProp
+	tableScale := util.Select(runtime.GOOS == "windows", p.DPIScale(), float32(1))
+	if imgui.BeginTableV("arrivalgroups", int32(1+2*aarColumns), flags, imgui.Vec2{tableScale * float32(150+250*aarColumns), 0}, 0.) {
+		imgui.TableSetupColumn("Airport")
+		for range aarColumns {
+			imgui.TableSetupColumn("Arrival")
+			imgui.TableSetupColumn("Active")
+		}
+		imgui.TableHeadersRow()
+
+		for ap := range util.SortedMap(numAirportFlows) {
+			imgui.PushIDStr(ap)
+			imgui.TableNextRow()
+			imgui.TableNextColumn()
+			imgui.Text(ap)
+
+			aarCol := 0
+			for group, apEnabled := range util.SortedMap(lc.InboundFlowEnabled) {
+				imgui.PushIDStr(group)
+				if enabled, ok := apEnabled[ap]; ok {
+					if aarCol > 0 && aarCol%aarColumns == 0 {
+						// Overflow
+						imgui.TableNextRow()
+						imgui.TableNextColumn()
+					}
+
+					imgui.TableNextColumn()
+					imgui.Text(group)
+					imgui.TableNextColumn()
+					if imgui.Checkbox("##enabled", &enabled) {
+						lc.InboundFlowEnabled[group][ap] = enabled
+						changed = true
+					}
+					aarCol++
+				}
+				imgui.PopID()
+			}
+			imgui.PopID()
+		}
+		imgui.EndTable()
+	}
+
+	imgui.Separator()
+
+	return
+}
+
 func drawDepartureUI(lc *sim.LaunchConfig, p platform.Platform) (changed bool) {
+	if lc.TrafficSource != sim.TrafficSourceScenario {
+		return drawPublishedDepartureUI(lc, p)
+	}
 	if len(lc.DepartureRates) == 0 {
 		return
 	}
@@ -1540,6 +2250,9 @@ func drawArrivalUI(lc *sim.LaunchConfig, p platform.Platform) (changed bool) {
 	if len(numAirportFlows) == 0 { // no arrivals
 		return
 	}
+	if lc.TrafficSource != sim.TrafficSourceScenario {
+		return drawPublishedArrivalUI(lc, p)
+	}
 	maxAirportFlows := 0
 	for _, n := range numAirportFlows {
 		maxAirportFlows = max(n, maxAirportFlows)
@@ -1631,6 +2344,10 @@ func drawOverflightUI(lc *sim.LaunchConfig, p platform.Platform) (changed bool) 
 		return
 	}
 
+	if lc.TrafficSource != sim.TrafficSourceScenario {
+		imgui.TextDisabled("Overflights are randomly generated; these rates apply with any traffic source.")
+	}
+
 	ofColumns := min(3, len(overflightGroups))
 	flags := imgui.TableFlagsBordersV | imgui.TableFlagsBordersOuterH | imgui.TableFlagsRowBg | imgui.TableFlagsSizingStretchProp
 	tableScale := util.Select(runtime.GOOS == "windows", p.DPIScale(), float32(1))
@@ -1670,11 +2387,6 @@ func drawOverflightUI(lc *sim.LaunchConfig, p platform.Platform) (changed bool) 
 	}
 
 	return
-}
-
-func drawEmergencyAircraftUI(lc *sim.LaunchConfig, p platform.Platform) {
-	imgui.SliderFloatV("Emergency Aircraft Rate (per hour)", &lc.EmergencyAircraftRate,
-		0, 20, util.Select(lc.EmergencyAircraftRate == 0, "never", "%.1f"), imgui.SliderFlagsNone)
 }
 
 func controllerDisplayLabel(controllers map[av.ControlPosition]*av.Controller, pos av.ControlPosition) string {
@@ -2154,10 +2866,15 @@ func (c *NewSimConfiguration) drawWeatherFilterUI() {
 		imgui.Text("Start time:")
 		imgui.TableNextColumn()
 		metar := c.airportMETAR[metarAirports[0]]
-		TimePicker(&c.NewSimRequest.StartTime, c.availableWXIntervals, metar, ui.fixedFont)
+		TimePicker(&c.NewSimRequest.StartTime, c.startTimeIntervals(c.ScenarioSpec), metar, ui.fixedFont)
 		imgui.SameLine()
 		if imgui.Button(renderer.FontAwesomeIconRedo + "##refreshTime") {
 			c.updateStartTimeForRunways(c.ScenarioSpec)
+		}
+		if location, ok := av.DB.AirportTimeZones[c.ScenarioSpec.PrimaryAirport]; ok {
+			imgui.SameLine()
+			LocalTimeSlider(&c.NewSimRequest.StartTime, location, c.startTimeIntervals(c.ScenarioSpec),
+				timeSliderWidth)
 		}
 
 		// METAR
@@ -2167,7 +2884,7 @@ func (c *NewSimConfiguration) drawWeatherFilterUI() {
 		imgui.TableNextColumn()
 		currentMetar := wx.METARForTime(c.airportMETAR[metarAirports[0]], c.NewSimRequest.StartTime)
 		ui.fixedFont.ImguiPush()
-		imgui.Text(strings.TrimPrefix(strings.TrimPrefix(currentMetar.Observation(), "METAR "), "SPECI "))
+		imgui.Text(c.metarText(currentMetar))
 		imgui.PopFont()
 
 		if c.showAllMETAR && len(metarAirports) > 1 {
@@ -2178,7 +2895,7 @@ func (c *NewSimConfiguration) drawWeatherFilterUI() {
 				imgui.TableNextColumn()
 				ui.fixedFont.ImguiPush()
 				m := wx.METARForTime(c.airportMETAR[ap], c.NewSimRequest.StartTime)
-				imgui.Text(strings.TrimPrefix(strings.TrimPrefix(m.Observation(), "METAR "), "SPECI "))
+				imgui.Text(c.metarText(m))
 				imgui.PopFont()
 			}
 		}
@@ -2196,6 +2913,42 @@ func (c *NewSimConfiguration) drawWeatherFilterUI() {
 		c.updateStartTimeForRunways(c.ScenarioSpec)
 	}
 }
+
+// startTimeIntervals returns the times a sim may start at. When the scenario is
+// flying historical traffic the weather intervals are narrowed to the days the
+// flight data covers, less a final day so that a sim started near the end still
+// has traffic to fly.
+func (c *NewSimConfiguration) startTimeIntervals(spec *server.ScenarioSpec) []util.TimeInterval {
+	if spec == nil || spec.LaunchConfig.TrafficSource != sim.TrafficSourceHistorical {
+		return c.availableWXIntervals
+	}
+
+	flights := spec.HistoricalFlightInterval
+	flights[1] = flights[1].Add(-24 * time.Hour)
+
+	var intervals []util.TimeInterval
+	for _, iv := range c.availableWXIntervals {
+		start, end := iv[0].UTC(), iv[1].UTC()
+		if start.Before(flights[0]) {
+			start = flights[0]
+		}
+		if end.After(flights[1]) {
+			end = flights[1]
+		}
+		if start.Before(end) {
+			intervals = append(intervals, util.TimeInterval{start, end})
+		}
+	}
+	return intervals
+}
+
+// Default sim start times are picked between these local hours at the primary
+// airport, so that nobody inadvertently runs a sim in the middle of the night
+// and wonders where the traffic is.
+const (
+	defaultStartLocalHourMin = 7  // 7am
+	defaultStartLocalHourMax = 19 // 7pm
+)
 
 func (c *NewSimConfiguration) updateStartTimeForRunways(spec *server.ScenarioSpec) {
 	c.weatherFilterError = ""
@@ -2216,18 +2969,30 @@ func (c *NewSimConfiguration) updateStartTimeForRunways(spec *server.ScenarioSpe
 	}
 
 	if apMETAR, ok := c.airportMETAR[ap]; ok && len(apMETAR) > 0 {
-		// Sample using the combined weather filter (ground winds + winds aloft)
-		sampledMETAR := wx.SampleWeatherWithFilter(
-			apMETAR,
-			c.atmosByTime,
-			c.availableWXIntervals,
-			&c.weatherFilter,
-			c.windsAloftAltitudes,
-			spec.MagneticVariation)
+		intervals := c.startTimeIntervals(spec)
+		location := av.DB.AirportTimeZones[spec.PrimaryAirport]
 
-		if sampledMETAR != nil {
+		// Sample using the combined weather filter (ground winds + winds
+		// aloft), retrying for a daytime start at the primary airport: a sim
+		// inadvertently started in the middle of the night has hardly any
+		// traffic to work. If the weather filter only matches nighttime, the
+		// weather wins and the last sample is kept.
+		var sampledMETAR *wx.METAR
+		var startTime time.Time
+		for range 25 {
+			sampledMETAR = wx.SampleWeatherWithFilter(
+				apMETAR,
+				c.atmosByTime,
+				intervals,
+				&c.weatherFilter,
+				c.windsAloftAltitudes,
+				spec.MagneticVariation)
+			if sampledMETAR == nil {
+				break
+			}
+
 			// Start at a random time between the sampled METAR and the next one
-			startTime := sampledMETAR.Time.UTC()
+			startTime = sampledMETAR.Time.UTC()
 			idx, _ := slices.BinarySearchFunc(apMETAR, sampledMETAR.Time, func(m wx.METAR, t time.Time) int {
 				return m.Time.Compare(t)
 			})
@@ -2235,6 +3000,17 @@ func (c *NewSimConfiguration) updateStartTimeForRunways(spec *server.ScenarioSpe
 				validDuration := apMETAR[idx+1].Time.Sub(sampledMETAR.Time)
 				startTime = startTime.Add(rand.Make().DurationRange(0, validDuration))
 			}
+
+			if location == nil {
+				break
+			}
+			if hour := startTime.In(location).Hour(); hour >= defaultStartLocalHourMin &&
+				hour < defaultStartLocalHourMax {
+				break
+			}
+		}
+
+		if sampledMETAR != nil {
 			c.StartTime = startTime
 
 			// Set VFR launch rate to zero if selected weather is IMC;

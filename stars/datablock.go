@@ -456,8 +456,8 @@ func (sp *STARSPane) getDatablock(ctx *panes.Context, trk sim.Track, sfp *sim.NA
 
 	case FullDatablock:
 		return sp.buildFullDatablock(ctx, trk, sfp, color, brightness,
-			altitude, sp1, groundspeed, handoffId, handoffTCP, actype,
-			pilotReportedAltitude, beaconator, beaconMismatch,
+			altitude, sp1, groundspeed, ahopInhibitIndicator(ctx, sfp, handoffId),
+			handoffTCP, actype, pilotReportedAltitude, beaconator, beaconMismatch,
 			displayBeaconCode)
 
 	case SuspendedDatablock:
@@ -531,6 +531,23 @@ func (sp *STARSPane) resolveHandoff(ctx *panes.Context, sfp *sim.NASFlightPlan,
 	return
 }
 
+// ahopInhibitIndicator returns the AHOP inhibit delta in place of handoffId
+// for a locally-owned track that is ineligible for automatic handoff, when no
+// handoff receiver id currently occupies the field (STARS Figure 2-20,
+// p. 2-66: FDB field 4 carries either the handoff receiver position symbol or
+// the delta). The delta appears in full datablocks only; the PDB's
+// corresponding field shows just the handoff receiver (Figure 2-22, p. 2-69).
+// Tracks whose owner has AHOP inhibited outright don't show it (STARS 4.3 /
+// 8.8).
+func ahopInhibitIndicator(ctx *panes.Context, sfp *sim.NASFlightPlan, handoffId string) string {
+	if handoffId == " " && sfp != nil && sfp.AutoHandoffInhibited &&
+		!ctx.Client.State.IsExternalController(sfp.TrackingController) &&
+		!ctx.Client.State.AutoHandoffInhibitedForTCW(sfp.OwningTCW) {
+		return STARSTriangleCharacter
+	}
+	return handoffId
+}
+
 func formatAltitude(trk sim.Track, sfp *sim.NASFlightPlan, unreasonableModeC bool) (altitude string, pilotReported bool) {
 	if trk.IsUnsupportedDB() {
 		if sfp != nil && sfp.PilotReportedAltitude != 0 {
@@ -598,6 +615,15 @@ func (sp *STARSPane) resolveScratchpad1(ctx *panes.Context, trk sim.Track,
 		return ""
 	}
 	abbrevExit := func() string {
+		// When fix-pair reassignment substituted a derived exit fix, its
+		// abbreviation is displayed if it has one adapted; otherwise the
+		// actual exit fix's abbreviation remains.
+		if d := sfp.DerivedExitFix; d != "" {
+			d, _, _ = strings.Cut(d, ".")
+			if sigPt, ok := sp.significantPoints[d]; ok && sigPt.Abbreviation != "" {
+				return sigPt.Abbreviation
+			}
+		}
 		e := sfp.ExitFix
 		if e == "" {
 			return ""
@@ -948,20 +974,16 @@ func (sp *STARSPane) fillFDBField5(ctx *panes.Context, trk sim.Track, sfp *sim.N
 			formatDBText(field[idx:], rulesCategory, color, false)
 			return
 		}
-		if state.IFFlashing {
-			if trk.Ident {
-				formatDBText(field, "IF"+"ID", color, true)
-			} else {
-				formatDBText(field, "IF"+rulesCategory, color, true)
-			}
+		// The speed slot shows a blinking "IF" on an interfacility transfer
+		// error (FDB_L2_SPEED, xfer_error_flag != ho_if_err_ok), else "HL" when
+		// holding, else the groundspeed. The trailing indicator (ident, or
+		// flight-rules + CWT) follows it in every case.
+		speed := util.Select(state.IFFlashing, "IF", util.Select(sfp.HoldState, "HL", groundspeed))
+		idx := formatDBText(field, speed, color, state.IFFlashing)
+		if trk.Ident {
+			formatDBText(field[idx:], "ID", color, true)
 		} else {
-			gs := util.Select(sfp.HoldState, "HL", groundspeed)
-			idx := formatDBText(field, gs, color, false)
-			if trk.Ident {
-				formatDBText(field[idx:], "ID", color, true)
-			} else {
-				formatDBText(field[idx:], rulesCategory, color, false)
-			}
+			formatDBText(field[idx:], rulesCategory, color, false)
 		}
 	}
 
